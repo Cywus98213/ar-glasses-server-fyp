@@ -40,9 +40,7 @@ ENV PYTHONWARNINGS=ignore
 ENV TF_CPP_MIN_LOG_LEVEL=3
 ENV TOKENIZERS_PARALLELISM=false
 
-# Health check for Railway
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# No health check - Railway will detect WebSocket service automatically
 
 # Run the lite server for Railway
 CMD ["python", "ar_glasses_server_lite.py"]

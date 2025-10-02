@@ -18,27 +18,9 @@ import soundfile as sf
 from pathlib import Path
 import websockets
 from websockets.server import serve
-import http.server
-import socketserver
-import threading
-
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
-
-class HealthHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        pass  # Suppress logs
 
 class ARGlassesServerLite:
     def __init__(self):
@@ -224,22 +206,14 @@ def main():
     print("Basic audio processing for Railway deployment")
     print("=" * 60)
     
-    # Start health server
-    health_server = socketserver.TCPServer(("", 8080), HealthHandler)
-    health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
-    health_thread.start()
-    print("[SERVER] Health server running on port 8080")
-    
     server = ARGlassesServerLite()
     
     try:
         asyncio.run(server.start_server())
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down...")
-        health_server.shutdown()
     except Exception as e:
         print(f"[SERVER] Error: {e}")
-        health_server.shutdown()
 
 if __name__ == "__main__":
     main()
