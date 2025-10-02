@@ -1,0 +1,51 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Environment files (Railway uses its own env vars)
+.env
+config.env
+docker.env
+*.env.local
+
+# Runtime generated files (Railway creates these)
+debug_json_output/
+debug_audio/
+pretrained_models/
+speakers.db
+*.log
+*.db
+
+# Large files (too big for Git)
+recorded_audio/
+testing_audio/
+*.wav
+*.mp3
+*.flac
+
+# Test files (not needed for Railway)
+test_*.py
+*_test.py
+run_all_tests.py
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Extra deployment files (Railway only needs Dockerfile)
+cloudbuild.yaml
+.do/
+docker-run.*
+setup-docker.*
+*_CHECKLIST.md
+*_FILES.md
+RAILWAY_*.md

@@ -1,0 +1,30 @@
+# Optimized AR Glasses System Requirements
+# Core dependencies
+torch>=1.9.0
+torchaudio>=0.9.0
+numpy>=1.21.0
+soundfile>=0.10.0
+librosa>=0.9.0
+scikit-learn>=1.0.0
+
+# Audio processing
+pyannote.audio>=3.1.0
+faster-whisper>=0.10.0
+scipy>=1.7.0
+numpy>=1.21.0
+
+# SpeechBrain for accurate speaker recognition
+speechbrain>=0.5.16
+torch-audiomentations>=0.11.0
+
+# Hugging Face Transformers for Whisper large-v3
+transformers>=4.40.0
+accelerate>=0.20.0
+
+# WebSocket server
+websockets>=10.0
+
+# Database (sqlite3 is built into Python)
+
+# Utilities (built-in modules - no installation needed)
+# asyncio, pathlib, concurrent.futures, threading, queue, warnings
