@@ -14,6 +14,7 @@ env/
 config.env
 docker.env
 *.env.local
+.env
 
 # Runtime generated files (Railway creates these)
 debug_json_output/

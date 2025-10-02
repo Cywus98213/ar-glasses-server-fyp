@@ -11,16 +11,18 @@ RUN apt-get update && apt-get install -y \
     make \
     libsndfile1 \
     ffmpeg \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies with optimizations for Railway
+# Install Python dependencies with memory optimization
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --timeout=1000 \
-    torch torchaudio --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir --timeout=1000 -r requirements.txt
+    torch==2.0.1 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir --timeout=1000 -r requirements.txt && \
+    pip cache purge
 
 # Copy application code
 COPY . .
@@ -37,9 +39,9 @@ ENV PYTHONWARNINGS=ignore
 ENV TF_CPP_MIN_LOG_LEVEL=3
 ENV TOKENIZERS_PARALLELISM=false
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=5)" || exit 1
+# Health check for Railway
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the server
 CMD ["python", "ar_glasses_server.py"]
