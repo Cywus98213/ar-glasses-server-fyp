@@ -22,7 +22,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --timeout=1000 \
     torch==2.0.1 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir --timeout=1000 -r requirements.txt && \
-    pip cache purge
+    pip cache purge && \
+    # Clean up to reduce image size
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Copy application code
 COPY . .

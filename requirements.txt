@@ -1,17 +1,16 @@
-# Minimal dependencies for memory-constrained deployment
+# Core dependencies for Railway deployment
 numpy==1.24.3
 soundfile==0.12.1
 scipy==1.10.1
 scikit-learn==1.3.0
 
-# Lightweight audio processing
+# Audio processing
 faster-whisper==0.10.0
 transformers==4.35.0
+speechbrain>=0.5.16
 
 # WebSocket server
 websockets==11.0.3
 
-# Essential only - remove heavy packages for now
-# pyannote.audio>=3.1.0  # Too memory intensive
-# speechbrain>=0.5.16    # Too memory intensive  
-# accelerate>=0.20.0     # Not essential
+# Heavy packages - add back as needed
+pyannote.audio>=3.1.0
