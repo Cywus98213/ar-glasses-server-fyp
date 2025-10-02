@@ -53,20 +53,44 @@ class OptimizedDiarizationPipeline:
             print(f"[OPTIMIZED] Warning: Could not configure diarization parameters: {e}")
             print("[OPTIMIZED] Using default diarization settings")
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"  # Force CPU for memory efficiency on Render
+        
         self.whisper_model = WhisperModel(
-            "large-v3",  # Best accuracy for Cantonese 
+            "large-v3",
             device=device,
-            compute_type="float16" if device == "cuda" else "int8"  # Optimized compute type
+            compute_type="int8",  # Use int8 for maximum memory efficiency
+            num_workers=1,  # Limit workers to save memory
+            download_root=None,  # Use default cache
+            local_files_only=False
         )
         
-        # Cache for frequently used audio segments
+        # Minimal cache for memory efficiency
         self.audio_cache = {}
         self.cache_lock = threading.Lock()
+        self.max_cache_size = 5  # Limit cache size
+        
+        # Memory management
+        self._cleanup_memory()
         
         print("[OPTIMIZED] Optimized Diarization Pipeline initialized successfully")
         print(f"[OPTIMIZED] Using device: {device}")
-        print(f"[OPTIMIZED] Whisper model: large-v3 (best accuracy for Cantonese)")
+        
+    def _cleanup_memory(self):
+        """Clean up memory to prevent OOM."""
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+    def _manage_cache(self):
+        """Manage cache size to prevent memory overflow."""
+        with self.cache_lock:
+            if len(self.audio_cache) > self.max_cache_size:
+                # Remove oldest entries
+                keys_to_remove = list(self.audio_cache.keys())[:-self.max_cache_size]
+                for key in keys_to_remove:
+                    del self.audio_cache[key]
+                self._cleanup_memory()
 
     def preprocess_audio(self, audio_segment: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
         """Preprocess audio for maximum transcription accuracy."""
@@ -270,6 +294,10 @@ class OptimizedDiarizationPipeline:
                     if rms_energy < 0.002:  # Even lower threshold for better multi-speaker detection
                         print(f"[OPTIMIZED] Skipping low energy segment: {rms_energy:.4f}")
                         continue
+                    
+                    # Memory cleanup before processing each segment
+                    self._manage_cache()
+                    self._cleanup_memory()
                     
                     # OPTIMIZATION 4: Use cached transcription if available
                     segment_key = f"{start_time:.2f}_{end_time:.2f}_{speaker}"

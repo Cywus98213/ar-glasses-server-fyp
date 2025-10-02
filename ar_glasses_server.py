@@ -13,11 +13,7 @@ from typing import Dict, Any, List
 import soundfile as sf
 from pathlib import Path
 import websockets
-from websockets.server import serve
 import torch
-import http.server
-import socketserver
-import threading
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
@@ -28,27 +24,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from speaker_recognition import OptimizedSpeakerRecognition
 from speaker_diarization import OptimizedDiarizationPipeline
 
-class HealthHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        pass  # Suppress logs
-
 class ARGlassesServer:
     def __init__(self):
         """Initialize the AR Glasses server with speaker recognition."""
         print("[SERVER] Initializing AR Glasses Server...")
         
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        print(f"[SERVER] Using device: {self.device}")
+        # Force CPU for memory efficiency on Render
+        self.device = "cpu"
+        print(f"[SERVER] Using device: {self.device} (forced CPU for memory efficiency)")
         
         self.load_environment()
         
@@ -91,7 +74,17 @@ class ARGlassesServer:
         self.debug_json_dir.mkdir(exist_ok=True)
         self._clear_debug_output()
         
+        # Memory management
+        self._cleanup_memory()
+        
         print("[SERVER] Server initialized successfully")
+        
+    def _cleanup_memory(self):
+        """Clean up memory to prevent OOM."""
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
     def load_environment(self):
@@ -138,15 +131,31 @@ class ARGlassesServer:
     async def _safe_send_message(self, websocket, message: Dict[str, Any]):
         """Safely send message to WebSocket."""
         try:
-            await websocket.send(json.dumps(message))
+            # Check if connection is open using the new API
+            if hasattr(websocket, 'state'):
+                from websockets.protocol import State
+                if websocket.state == State.OPEN:
+                    await websocket.send(json.dumps(message))
+                    return True
+                else:
+                    print(f"[SERVER] Cannot send message - WebSocket state: {websocket.state}")
+                    return False
+            else:
+                # Fallback - just try to send
+                await websocket.send(json.dumps(message))
+                return True
         except Exception as e:
             print(f"[SERVER] Error sending message: {e}")
+            return False
 
     def process_audio(self, audio_array: np.ndarray, sample_rate: int) -> dict:
         """Process audio using optimized diarization only (faster processing)."""
         try:
             print(f"[SERVER] PROCESSING AUDIO: {len(audio_array)} samples at {sample_rate}Hz")
             print(f"[SERVER] Using optimized diarization pipeline for faster processing")
+            
+            # Clean up memory before processing
+            self._cleanup_memory()
             
             # Use only diarization pipeline (includes speaker detection and transcription)
             print("[SERVER] Running optimized diarization pipeline...")
@@ -206,6 +215,10 @@ class ARGlassesServer:
             
             print(f"[SERVER] PROCESSING COMPLETE: {len(processed_segments)} segments, {result['speaker_count']} speakers")
             print(f"[SERVER] Final processing method: {result['processing_method']}")
+            
+            # Clean up memory after processing
+            self._cleanup_memory()
+            
             return result
             
         except Exception as e:
@@ -220,28 +233,11 @@ class ARGlassesServer:
             }
 
 
-    async def handle_websocket(self, websocket, path):
+    async def handle_websocket(self, websocket):
         """Handle WebSocket connections."""
         print(f"[SERVER] New connection from {websocket.remote_address}")
         self.active_connections.add(websocket)
         
-        # Send periodic keep-alive messages more frequently
-        async def keep_alive():
-            while websocket.open:
-                try:
-                    await asyncio.sleep(10)  # Send every 10 seconds (very frequent)
-                    if websocket.open:
-                        await self._safe_send_message(websocket, {
-                            "type": "keep_alive",
-                            "timestamp": time.time()
-                        })
-                        print(f"[SERVER] Sent keep-alive to {websocket.remote_address}")
-                except Exception as e:
-                    print(f"[SERVER] Keep-alive error: {e}")
-                    break
-        
-        # Start keep-alive task
-        keep_alive_task = asyncio.create_task(keep_alive())
         
         try:
             async for message in websocket:
@@ -401,12 +397,6 @@ class ARGlassesServer:
         except Exception as e:
             print(f"[SERVER] WebSocket error: {e}")
         finally:
-            # Cancel keep-alive task
-            keep_alive_task.cancel()
-            try:
-                await keep_alive_task
-            except asyncio.CancelledError:
-                pass
             self.active_connections.discard(websocket)
 
     async def start_server(self):
@@ -415,15 +405,18 @@ class ARGlassesServer:
         
         self.main_loop = asyncio.get_event_loop()
         
-        async with serve(
+        async with websockets.serve(
             self.handle_websocket,
             self.host,
             self.port,
-            ping_interval=10,  # More aggressive ping every 10 seconds
-            ping_timeout=30,   # 30 second timeout
-            close_timeout=10,  # Faster close timeout
-            max_size=2**20,    # 1MB max message size
-            max_queue=32       # Max queued messages
+            ping_interval=None,    # Disable automatic pings (or use 60 for 1 minute)
+            ping_timeout=60,       # 60 second timeout for ping responses
+            close_timeout=30,      # 30 second timeout for close handshake
+            max_size=10**7,        # 10MB max message size (for larger audio files)
+            max_queue=128,         # More queued messages
+            # Additional timeout settings:
+            open_timeout=30,       # 30 seconds to complete opening handshake
+            logger=None            # Disable internal logging for cleaner output
         ):
             print(f"[SERVER] Server running on ws://{self.host}:{self.port}")
             print("[SERVER] Press Ctrl+C to stop")
@@ -436,22 +429,14 @@ def main():
     print("Speaker recognition with diarization")
     print("=" * 60)
     
-    # Start simple health server on port 8080
-    health_server = socketserver.TCPServer(("", 8080), HealthHandler)
-    health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
-    health_thread.start()
-    print("[SERVER] Health server running on port 8080")
-    
     server = ARGlassesServer()
     
     try:
         asyncio.run(server.start_server())
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down...")
-        health_server.shutdown()
     except Exception as e:
         print(f"[SERVER] Error: {e}")
-        health_server.shutdown()
 
 if __name__ == "__main__":
     main()

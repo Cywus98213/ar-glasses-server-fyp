@@ -13,7 +13,7 @@ import threading
 from collections import defaultdict
 import torch
 import torchaudio
-from speechbrain.pretrained import EncoderClassifier
+# Removed speechbrain to save memory - using alternative approach
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -231,34 +231,18 @@ class OptimizedSpeakerRecognition:
         # Simple speaker recognition for whole audio processing
         self.similarity_threshold = 0.6  # Threshold for speaker similarity
         
-        # Initialize SpeechBrain speaker encoder (ECAPA-TDNN - state-of-the-art)
-        print("[SPEECHBRAIN] Loading ECAPA-TDNN speaker encoder...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Use simplified speaker recognition for memory efficiency
+        print("[OPTIMIZED] Using simplified speaker recognition (memory optimized)")
+        device = "cpu"  # Force CPU for memory efficiency
         
-        # Use model directly to avoid Windows symlink issues
-        print("[SPEECHBRAIN] Loading model directly from HuggingFace...")
-        self.speaker_encoder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": device}
-        )
-        
-        # Performance optimizations for SpeechBrain
-        self.speaker_encoder.eval()  # Set to evaluation mode
-        if device == "cuda":
-            self.speaker_encoder = self.speaker_encoder.half()  # Use half precision for speed
+        # Simple audio feature extraction for speaker recognition
+        self.device = device
         
         # Cache for embeddings to avoid recomputation
         self.embedding_cache = {}
-        self.cache_max_size = 1000  # Limit cache size
+        self.cache_max_size = 100  # Smaller cache size for memory efficiency
         
-        print(f"[SPEECHBRAIN] Speaker encoder loaded successfully on {device}")
-        print(f"[SPEECHBRAIN] Using half precision: {device == 'cuda'}")
-        
-        # Initialize optimized diarization pipeline
-        from optimized_diarization import OptimizedDiarizationPipeline
-        self.pipeline = OptimizedDiarizationPipeline(hf_token)
-        
-        print("[OPTIMIZED] Speaker recognition system initialized with SpeechBrain")
+        print(f"[OPTIMIZED] Simplified speaker recognition initialized on {device}")
         print(f"[OPTIMIZED] Known speakers: {len(self.db.get_all_speakers())}")
     
     def reset_session(self):
@@ -270,13 +254,13 @@ class OptimizedSpeakerRecognition:
         print("[OPTIMIZED] Session reset - speaker database, cache, and counter reset")
     
     def extract_speaker_embedding(self, audio_array: np.ndarray, start_time: float, end_time: float, sample_rate: int = 16000) -> np.ndarray:
-        """Extract speaker embedding using SpeechBrain ECAPA-TDNN (high accuracy with caching)."""
+        """Extract simple audio features for speaker recognition (memory optimized)."""
         # Convert time to samples
         start_sample = int(start_time * sample_rate)
         end_sample = int(end_time * sample_rate)
         segment = audio_array[start_sample:end_sample]
         
-        print(f"[OPTIMIZED] Extracting embedding: {start_time:.2f}s-{end_time:.2f}s, {len(segment)} samples")
+        print(f"[OPTIMIZED] Extracting simple features: {start_time:.2f}s-{end_time:.2f}s, {len(segment)} samples")
         
         # Create cache key based on audio content hash
         segment_hash = hash(segment.tobytes())
@@ -284,29 +268,78 @@ class OptimizedSpeakerRecognition:
             print(f"[OPTIMIZED] Using cached embedding")
             return self.embedding_cache[segment_hash]
         
-        # Ensure minimum length for SpeechBrain (at least 0.5 seconds)
+        # Ensure minimum length (at least 0.5 seconds)
         min_length = int(0.5 * sample_rate)
         if len(segment) < min_length:
             # Pad with zeros if too short
             padding = np.zeros(min_length - len(segment), dtype=np.float32)
             segment = np.concatenate([segment, padding])
         
-        # Convert to torch tensor and ensure correct format for SpeechBrain
-        audio_tensor = torch.tensor(segment, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
+        # Extract simple audio features for speaker recognition
+        # This is a simplified approach that uses basic audio statistics
+        embedding = self._extract_simple_features(segment, sample_rate)
         
-        # Extract speaker embedding using SpeechBrain ECAPA-TDNN
-        with torch.no_grad():
-            embedding = self.speaker_encoder.encode_batch(audio_tensor)
-            # Convert to numpy and flatten
-            embedding = embedding.squeeze().cpu().numpy()
-        
-        print(f"[OPTIMIZED] Generated embedding: shape={embedding.shape}, mean={np.mean(embedding):.3f}, std={np.std(embedding):.3f}")
+        print(f"[OPTIMIZED] Generated simple features: shape={embedding.shape}, mean={np.mean(embedding):.3f}, std={np.std(embedding):.3f}")
         
         # Cache the embedding (with size limit)
         if len(self.embedding_cache) < self.cache_max_size:
             self.embedding_cache[segment_hash] = embedding
         
         return embedding
+    
+    def _extract_simple_features(self, segment: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Extract simple audio features for speaker recognition (memory efficient)."""
+        # Basic statistical features
+        features = []
+        
+        # Time domain features
+        features.extend([
+            np.mean(segment),           # Mean amplitude
+            np.std(segment),            # Standard deviation
+            np.max(segment),            # Maximum amplitude
+            np.min(segment),            # Minimum amplitude
+            np.mean(np.abs(segment)),   # Mean absolute value
+        ])
+        
+        # Spectral features (simplified)
+        # Compute FFT
+        fft = np.fft.fft(segment)
+        magnitude = np.abs(fft[:len(fft)//2])  # Take only positive frequencies
+        
+        # Spectral centroid (center of mass of spectrum)
+        freqs = np.fft.fftfreq(len(segment), 1/sample_rate)[:len(fft)//2]
+        spectral_centroid = np.sum(freqs * magnitude) / np.sum(magnitude) if np.sum(magnitude) > 0 else 0
+        features.append(spectral_centroid)
+        
+        # Spectral rolloff (frequency below which 85% of energy is contained)
+        cumsum = np.cumsum(magnitude)
+        rolloff_idx = np.where(cumsum >= 0.85 * cumsum[-1])[0]
+        spectral_rolloff = freqs[rolloff_idx[0]] if len(rolloff_idx) > 0 else 0
+        features.append(spectral_rolloff)
+        
+        # Zero crossing rate
+        zero_crossings = np.sum(np.diff(np.sign(segment)) != 0) / len(segment)
+        features.append(zero_crossings)
+        
+        # Energy in different frequency bands
+        low_freq = magnitude[:len(magnitude)//4]    # Low frequencies
+        mid_freq = magnitude[len(magnitude)//4:3*len(magnitude)//4]  # Mid frequencies
+        high_freq = magnitude[3*len(magnitude)//4:]  # High frequencies
+        
+        features.extend([
+            np.sum(low_freq**2),   # Low frequency energy
+            np.sum(mid_freq**2),   # Mid frequency energy
+            np.sum(high_freq**2),  # High frequency energy
+        ])
+        
+        # Convert to numpy array and normalize
+        features = np.array(features, dtype=np.float32)
+        
+        # Normalize features to prevent numerical issues
+        if np.std(features) > 0:
+            features = (features - np.mean(features)) / np.std(features)
+        
+        return features
     
     def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000) -> Dict:
         """Process audio array with optimized speaker recognition."""

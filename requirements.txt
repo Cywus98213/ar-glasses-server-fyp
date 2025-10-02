@@ -1,20 +1,22 @@
-# Full version requirements (for local development)
-numpy>=1.21.0
-soundfile>=0.10.0
-scipy>=1.7.0
-scikit-learn>=1.0.0
-librosa>=0.9.0
+# Memory-optimized requirements for Render deployment
+numpy>=1.21.0,<1.25.0
+soundfile>=0.10.0,<0.13.0
+scipy>=1.7.0,<1.12.0
+scikit-learn>=1.0.0,<1.4.0
 
-# Audio processing (full version)
-torch>=1.9.0
-torchaudio>=0.9.0
-pyannote.audio>=3.1.0
-faster-whisper>=0.10.0
-speechbrain>=0.5.16
+# Audio processing (memory optimized versions)
+torch>=1.9.0,<2.1.0
+torchaudio>=0.9.0,<2.1.0
+pyannote.audio>=3.1.0,<3.2.0
+faster-whisper>=0.10.0,<1.1.0
 
-# Hugging Face
-transformers>=4.35.0
-accelerate>=0.20.0
+# Hugging Face (minimal versions)
+transformers>=4.35.0,<4.37.0
+accelerate>=0.20.0,<0.25.0
 
 # WebSocket server
-websockets>=10.0
+websockets>=10.0,<12.0
+
+# Remove heavy dependencies to save memory
+# librosa - removed to save memory
+# speechbrain - removed to save memory
