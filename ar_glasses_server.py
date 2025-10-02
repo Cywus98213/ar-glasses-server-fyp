@@ -205,6 +205,12 @@ class ARGlassesServer:
 
     async def handle_websocket(self, websocket, path):
         """Handle WebSocket connections."""
+        # Handle health check requests
+        if path == '/health':
+            await websocket.send('{"status": "healthy"}')
+            await websocket.close()
+            return
+            
         print(f"[SERVER] New connection from {websocket.remote_address}")
         self.active_connections.add(websocket)
         
@@ -419,22 +425,14 @@ def main():
     print("Speaker recognition with diarization")
     print("=" * 60)
     
-    # Start health check server on port 8080
-    health_server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
-    health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
-    health_thread.start()
-    print("[SERVER] Health check server running on port 8080")
-    
     server = ARGlassesServer()
     
     try:
         asyncio.run(server.start_server())
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down...")
-        health_server.shutdown()
     except Exception as e:
         print(f"[SERVER] Error: {e}")
-        health_server.shutdown()
 
 if __name__ == "__main__":
     main()
