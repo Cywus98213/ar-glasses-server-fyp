@@ -50,3 +50,5 @@ setup-docker.*
 *_CHECKLIST.md
 *_FILES.md
 RAILWAY_*.md
+
+# Keep railway.toml for configuration

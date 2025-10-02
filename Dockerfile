@@ -14,12 +14,14 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy lightweight requirements for Railway
-COPY requirements-lite.txt .
+# Copy full requirements for Render
+COPY requirements.txt .
 
-# Install minimal Python dependencies for Railway
+# Install full Python dependencies for Render
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --timeout=300 -r requirements-lite.txt && \
+    pip install --no-cache-dir --timeout=1000 \
+    torch==2.0.1 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir --timeout=1000 -r requirements.txt && \
     pip cache purge && \
     # Clean up to reduce image size
     apt-get clean && \
@@ -42,5 +44,5 @@ ENV TOKENIZERS_PARALLELISM=false
 
 # No health check - Railway will detect WebSocket service automatically
 
-# Run the lite server for Railway
-CMD ["python", "ar_glasses_server_lite.py"]
+# Run the full server for Render
+CMD ["python", "ar_glasses_server.py"]
