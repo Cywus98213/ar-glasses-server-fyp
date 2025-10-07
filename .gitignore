@@ -52,3 +52,5 @@ setup-docker.*
 RAILWAY_*.md
 
 # Keep railway.toml for configuration
+
+android_app_files/

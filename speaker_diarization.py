@@ -16,10 +16,10 @@ warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-class OptimizedDiarizationPipeline:
+class DiarizationPipeline:
     def __init__(self, hf_token: str):
-        """Initialize the optimized diarization pipeline with performance improvements."""
-        print("[OPTIMIZED] Initializing Optimized Diarization Pipeline...")
+        """Initialize the diarization pipeline with performance improvements."""
+        print("[DIARIZATION] Initializing Diarization Pipeline...")
         
         os.environ["HF_TOKEN"] = hf_token
         
@@ -44,14 +44,14 @@ class OptimizedDiarizationPipeline:
         try:
             self.diarization_pipeline.instantiate({
                 "clustering": {
-                    "threshold": 0.4,  # Lower threshold for better multi-speaker detection
-                    "min_cluster_size": 1,  # Allow single-speaker clusters
+                    "threshold": 0.3,  # Lower threshold for better detection
+                    "min_cluster_size": 1,  # Allow single segments
                 }
             })
-            print("[OPTIMIZED] Diarization configured for better multi-speaker detection")
+            print("[DIARIZATION] Diarization configured for better multi-speaker detection")
         except Exception as e:
-            print(f"[OPTIMIZED] Warning: Could not configure diarization parameters: {e}")
-            print("[OPTIMIZED] Using default diarization settings")
+            print(f"[DIARIZATION] Warning: Could not configure diarization parameters: {e}")
+            print("[DIARIZATION] Using default diarization settings")
         
         device = "cpu"  # Force CPU for memory efficiency on Render
         
@@ -72,8 +72,8 @@ class OptimizedDiarizationPipeline:
         # Memory management
         self._cleanup_memory()
         
-        print("[OPTIMIZED] Optimized Diarization Pipeline initialized successfully")
-        print(f"[OPTIMIZED] Using device: {device}")
+        print("[DIARIZATION] Optimized Diarization Pipeline initialized successfully")
+        print(f"[DIARIZATION] Using device: {device}")
         
     def _cleanup_memory(self):
         """Clean up memory to prevent OOM."""
@@ -146,7 +146,7 @@ class OptimizedDiarizationPipeline:
             return text
             
         except Exception as e:
-            print(f"[OPTIMIZED] Error transcribing segment: {e}")
+            print(f"[DIARIZATION] Error transcribing segment: {e}")
             return ""
 
 
@@ -200,19 +200,19 @@ class OptimizedDiarizationPipeline:
         detected_lang = getattr(info, 'language', 'unknown')
         lang_confidence = getattr(info, 'language_probability', 0.0)
         
-        print(f"[OPTIMIZED] Detected language: {detected_lang} (confidence: {lang_confidence:.3f})")
-        print(f"[OPTIMIZED] Raw transcription: '{text}'")
+        print(f"[DIARIZATION] Detected language: {detected_lang} (confidence: {lang_confidence:.3f})")
+        print(f"[DIARIZATION] Raw transcription: '{text}'")
         
         # Check if text contains Cantonese characters (CJK Unified Ideographs)
         has_cantonese = any('\u4e00' <= char <= '\u9fff' for char in text)
         
         if has_cantonese:
-            print(f"[OPTIMIZED] Text contains Cantonese characters - keeping as-is")
+            print(f"[DIARIZATION] Text contains Cantonese characters - keeping as-is")
             return text
         
         # If we get English output when expecting Cantonese, try to force Cantonese
-        print(f"[OPTIMIZED] Text appears to be English, but we expected Cantonese")
-        print(f"[OPTIMIZED] This might be due to audio quality or model limitations")
+        print(f"[DIARIZATION] Text appears to be English, but we expected Cantonese")
+        print(f"[DIARIZATION] This might be due to audio quality or model limitations")
         
         # Return the text as-is for now, but log the issue
         return text
@@ -220,12 +220,29 @@ class OptimizedDiarizationPipeline:
     def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000) -> Dict[str, Any]:
         """Process audio array for speaker diarization and transcription (optimized)."""
         try:
-            print(f"[OPTIMIZED] Processing audio array: {len(audio_array)} samples, {sample_rate} Hz")
+            print(f"[DIARIZATION] Processing audio array: {len(audio_array)} samples, {sample_rate} Hz")
             
             # Ensure audio is mono and float32
             if len(audio_array.shape) > 1:
                 audio_array = audio_array.mean(axis=1)
             audio_array = audio_array.astype(np.float32)
+            
+            # Audio preprocessing for better diarization
+            # Normalize audio to improve detection
+            if np.max(np.abs(audio_array)) > 0:
+                audio_array = audio_array / np.max(np.abs(audio_array))
+            
+            # Apply gentle noise reduction
+            from scipy import signal
+            if len(audio_array) > 100:
+                # High-pass filter to remove low-frequency noise
+                nyquist = sample_rate / 2
+                high = 80.0 / nyquist  # 80 Hz high-pass filter
+                b, a = signal.butter(4, high, btype='high')
+                audio_array = signal.filtfilt(b, a, audio_array)
+                audio_array = audio_array.astype(np.float32)
+            
+            print(f"[DIARIZATION] Audio preprocessed: {len(audio_array)} samples, max={np.max(audio_array):.3f}")
             
             # Create temporary file for diarization (required by pyannote)
             temp_file = f"temp_audio_{int(time.time() * 1000)}.wav"
@@ -233,7 +250,7 @@ class OptimizedDiarizationPipeline:
             
             try:
                 # Perform speaker diarization
-                print("[OPTIMIZED] Running speaker diarization...")
+                print("[DIARIZATION] Running speaker diarization...")
                 diarization = self.diarization_pipeline(temp_file)
                 
                 # Debug: Print all detected speakers and their segments
@@ -247,23 +264,34 @@ class OptimizedDiarizationPipeline:
                         'end': turn.end,
                         'duration': turn.end - turn.start
                     })
-                print(f"[OPTIMIZED] Detected speakers: {sorted(unique_speakers)}")
-                print(f"[OPTIMIZED] Total diarization segments: {len(all_segments)}")
-                print(f"[OPTIMIZED] All diarization segments:")
+                print(f"[DIARIZATION] Detected speakers: {sorted(unique_speakers)}")
+                print(f"[DIARIZATION] Total diarization segments: {len(all_segments)}")
+                print(f"[DIARIZATION] All diarization segments:")
                 for i, seg in enumerate(all_segments):
                     print(f"  Segment {i+1}: {seg['speaker']} ({seg['start']:.2f}s - {seg['end']:.2f}s, {seg['duration']:.2f}s)")
                 
+                # Calculate total coverage
+                total_audio_duration = len(audio_array) / sample_rate
+                covered_duration = sum(seg['duration'] for seg in all_segments)
+                coverage_percent = (covered_duration / total_audio_duration) * 100
+                print(f"[DIARIZATION] Audio coverage: {covered_duration:.2f}s / {total_audio_duration:.2f}s ({coverage_percent:.1f}%)")
+                
                 # If no speakers detected, this might be the issue
                 if len(all_segments) == 0:
-                    print("[OPTIMIZED] WARNING: No speakers detected by diarization!")
-                    print("[OPTIMIZED] This could be due to:")
-                    print("[OPTIMIZED] - Audio too short or too quiet")
-                    print("[OPTIMIZED] - Diarization model issues")
-                    print("[OPTIMIZED] - Audio format problems")
+                    print("[DIARIZATION] WARNING: No speakers detected by diarization!")
+                    print("[DIARIZATION] This could be due to:")
+                    print("[DIARIZATION] - Audio too short or too quiet")
+                    print("[DIARIZATION] - Diarization model issues")
+                    print("[DIARIZATION] - Audio format problems")
                 
                 # Process each speaker segment with optimizations
                 segments = []
                 segment_count = 0
+                skipped_short = 0
+                skipped_energy = 0
+                skipped_empty = 0
+                
+                print(f"[DIARIZATION] Processing {len(all_segments)} diarization segments...")
                 
                 for turn, _, speaker in diarization.itertracks(yield_label=True):
                     start_time = turn.start
@@ -271,13 +299,13 @@ class OptimizedDiarizationPipeline:
                     duration = end_time - start_time
                     
                     # OPTIMIZATION 1: Skip very short segments (more lenient for multi-speaker)
-                    if duration < 0.2:  # Even more lenient for better multi-speaker detection
+                    if duration < 0.05:  # Very lenient - only skip extremely short segments
                         print(f"[OPTIMIZED] Skipping very short segment: {duration:.2f}s")
+                        skipped_short += 1
                         continue
                     
-                    # OPTIMIZATION 2: Skip segments that are too long (likely noise)
                     if duration > 15.0:  # Increased limit for longer conversations
-                        print(f"[OPTIMIZED] Skipping very long segment: {duration:.2f}s")
+                        print(f"[DIARIZATION] Skipping very long segment: {duration:.2f}s")
                         continue
                     
                     # Extract audio segment
@@ -291,15 +319,16 @@ class OptimizedDiarizationPipeline:
                     
                     # Calculate RMS energy
                     rms_energy = np.sqrt(np.mean(segment_audio**2))
-                    if rms_energy < 0.002:  # Even lower threshold for better multi-speaker detection
+                    if rms_energy < 0.0005:  # Very low threshold - only skip extremely quiet segments
                         print(f"[OPTIMIZED] Skipping low energy segment: {rms_energy:.4f}")
+                        skipped_energy += 1
                         continue
                     
                     # Memory cleanup before processing each segment
                     self._manage_cache()
                     self._cleanup_memory()
                     
-                    # OPTIMIZATION 4: Use cached transcription if available
+                    #  Use cached transcription if available
                     segment_key = f"{start_time:.2f}_{end_time:.2f}_{speaker}"
                     cached_text = None
                     
@@ -309,10 +338,10 @@ class OptimizedDiarizationPipeline:
                     
                     if cached_text is not None:
                         text = cached_text
-                        print(f"[OPTIMIZED] Using cached transcription for segment {segment_count + 1}")
+                        print(f"[DIARIZATION] Using cached transcription for segment {segment_count + 1}")
                     else:
                         # Transcribe segment
-                        print(f"[OPTIMIZED] Transcribing segment: {start_time:.2f}s - {end_time:.2f}s")
+                        print(f"[DIARIZATION] Transcribing segment: {start_time:.2f}s - {end_time:.2f}s")
                         text = self.transcribe_segment(segment_audio, sample_rate)
                         
                         # Cache the result
@@ -325,14 +354,15 @@ class OptimizedDiarizationPipeline:
                                 del self.audio_cache[oldest_key]
                     
                     # OPTIMIZATION 5: Filter out empty or very short transcriptions
-                    if not text or len(text.strip()) < 2:
+                    if not text or len(text.strip()) < 1:  # Very lenient - only skip completely empty
+                        skipped_empty += 1
                         continue
                     
                     # OPTIMIZATION 6: Filter out common noise patterns
-                    text_lower = text.lower().strip()
-                    noise_patterns = ["um", "uh", "ah", "eh", "oh", "mm", "hmm", "background", "noise", "static", "silence", "breathing"]
-                    if text_lower in noise_patterns:
-                        continue
+                    # text_lower = text.lower().strip()
+                    # noise_patterns = ["um", "uh", "ah", "eh", "oh", "mm", "hmm", "background", "noise", "static", "silence", "breathing"]
+                    # if text_lower in noise_patterns:
+                    #     continue
                     
                     # Add segment
                     segments.append({
@@ -345,9 +375,14 @@ class OptimizedDiarizationPipeline:
                     })
                     
                     segment_count += 1
-                    print(f"[OPTIMIZED] Added segment {segment_count}: {speaker} - '{text[:50]}{'...' if len(text) > 50 else ''}'")
+                    print(f"[DIARIZATION] Added segment {segment_count}: {speaker} - '{text[:50]}{'...' if len(text) > 50 else ''}'")
                 
-                print(f"[OPTIMIZED] Processing complete: {len(segments)} valid segments found")
+                print(f"[DIARIZATION] Processing complete: {len(segments)} valid segments found")
+                print(f"[DIARIZATION] Filtering summary:")
+                print(f"  - Skipped short segments: {skipped_short}")
+                print(f"  - Skipped low energy: {skipped_energy}")
+                print(f"  - Skipped empty transcriptions: {skipped_empty}")
+                print(f"  - Final valid segments: {len(segments)}")
                 
                 return {
                     'segments': segments,
@@ -362,14 +397,14 @@ class OptimizedDiarizationPipeline:
                     os.unlink(temp_file)
             
         except Exception as e:
-            print(f"[OPTIMIZED] Error processing audio array: {e}")
+            print(f"[DIARIZATION] Error processing audio array: {e}")
             return None
 
     def clear_cache(self):
         """Clear the audio cache to free memory."""
         with self.cache_lock:
             self.audio_cache.clear()
-            print("[OPTIMIZED] Audio cache cleared")
+            print("[DIARIZATION] Audio cache cleared")
 
     def get_cache_stats(self):
         """Get cache statistics."""
@@ -383,7 +418,7 @@ class OptimizedDiarizationPipeline:
 if __name__ == "__main__":
     # Test the optimized pipeline
     hf_token = os.getenv("HF_TOKEN", "hf_your_token_here")
-    pipeline = OptimizedDiarizationPipeline(hf_token)
+    pipeline = DiarizationPipeline(hf_token)
     
     # Test with a sample audio file
     test_file = "recorded_audio/20250316_223721.wav"

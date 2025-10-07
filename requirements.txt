@@ -17,6 +17,8 @@ accelerate>=0.20.0,<0.25.0
 # WebSocket server
 websockets>=10.0,<12.0
 
-# Remove heavy dependencies to save memory
-# librosa - removed to save memory
-# speechbrain - removed to save memory
+# SpeechBrain for neural embeddings (self-hosted version)
+speechbrain>=0.5.16,<0.6.0
+sentencepiece>=0.1.99
+hyperpyyaml>=1.1.0
+librosa>=0.9.0,<0.11.0

@@ -31,8 +31,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY . .
 
-# Create directories for debug output
-RUN mkdir -p debug_json_output recorded_audio testing_audio
+# Create directories for debug output and models
+RUN mkdir -p debug_json_output recorded_audio testing_audio pretrained_models
 
 # Expose port
 EXPOSE 8000

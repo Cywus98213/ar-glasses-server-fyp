@@ -21,8 +21,7 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from speaker_recognition import OptimizedSpeakerRecognition
-from speaker_diarization import OptimizedDiarizationPipeline
+from speaker_diarization import DiarizationPipeline
 
 class ARGlassesServer:
     def __init__(self):
@@ -45,12 +44,12 @@ class ARGlassesServer:
         
         try:
             # Initialize only diarization pipeline for faster processing
-            print("[SERVER] Initializing Optimized Diarization Pipeline...")
-            self.diarization_pipeline = OptimizedDiarizationPipeline(self.hf_token)
+            print("[SERVER] Initializing Diarization Pipeline...")
+            self.diarization_pipeline = DiarizationPipeline(self.hf_token)
             print("[SERVER] Diarization pipeline loaded successfully")
             
             print("[SERVER] Model loaded successfully!")
-            print("[SERVER] Using optimized diarization only for faster processing")
+            print("[SERVER] Using diarization only for faster processing")
             
         except Exception as e:
             print(f"[SERVER] CRITICAL ERROR: Failed to load diarization model!")
@@ -70,6 +69,10 @@ class ARGlassesServer:
         self.active_connections = set()
         self.main_loop = None
         
+        # Voice registration storage
+        self.registered_voices = {}  # voice_id -> voice_data
+        self.user_voice_exclusions = {}  # connection -> voice_id to exclude
+        
         self.debug_json_dir = Path("debug_json_output")
         self.debug_json_dir.mkdir(exist_ok=True)
         self._clear_debug_output()
@@ -85,6 +88,25 @@ class ARGlassesServer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _should_exclude_speaker(self, speaker_id, audio_array, sample_rate):
+        """Check if a speaker should be excluded based on voice registration."""
+        # For now, implement a simple check - in a real implementation,
+        # you would compare the speaker's voice characteristics with registered voices
+        # This is a placeholder for the voice matching logic
+        
+        # Check if any connection has voice exclusion enabled
+        for connection in self.active_connections:
+            if connection in self.user_voice_exclusions:
+                excluded_voice_id = self.user_voice_exclusions[connection]
+                if excluded_voice_id and excluded_voice_id in self.registered_voices:
+                    # Here you would implement actual voice matching
+                    # For now, we'll do a simple check based on speaker ID patterns
+                    if speaker_id.startswith("SPEAKER_00") or speaker_id == "SPEAKER_0":
+                        print(f"[SERVER] Voice exclusion: Speaker {speaker_id} matches exclusion pattern")
+                        return True
+        
+        return False
 
 
     def load_environment(self):
@@ -149,16 +171,16 @@ class ARGlassesServer:
             return False
 
     def process_audio(self, audio_array: np.ndarray, sample_rate: int) -> dict:
-        """Process audio using optimized diarization only (faster processing)."""
+        """Process audio using diarization only (faster processing)."""
         try:
             print(f"[SERVER] PROCESSING AUDIO: {len(audio_array)} samples at {sample_rate}Hz")
-            print(f"[SERVER] Using optimized diarization pipeline for faster processing")
+            print(f"[SERVER] Using diarization pipeline for faster processing")
             
             # Clean up memory before processing
             self._cleanup_memory()
             
             # Use only diarization pipeline (includes speaker detection and transcription)
-            print("[SERVER] Running optimized diarization pipeline...")
+            print("[SERVER] Running diarization pipeline...")
             diarization_result = self.diarization_pipeline.process_audio_array(audio_array, sample_rate)
             print(f"[SERVER] Diarization result: {diarization_result}")
             print(f"[SERVER] Processing method: {diarization_result.get('processing_method', 'unknown') if diarization_result else 'None'}")
@@ -195,6 +217,12 @@ class ARGlassesServer:
                 speaker_id = segment.get('speaker_id', f'SPEAKER_{i:02d}')
                 text = segment.get('transcription', segment.get('text', ''))
                 
+                # Check if this speaker should be excluded (voice exclusion feature)
+                should_exclude = self._should_exclude_speaker(speaker_id, audio_array, sample_rate)
+                if should_exclude:
+                    print(f"[SERVER] Excluding segment from registered user voice: {speaker_id}")
+                    continue
+                
                 processed_segments.append({
                     'speaker_id': speaker_id,
                     'text': text,
@@ -209,7 +237,7 @@ class ARGlassesServer:
             result = {
                 'segments': processed_segments,
                 'total_duration': len(audio_array) / sample_rate,
-                'processing_method': 'optimized_diarization',
+                'processing_method': 'diarization',
                 'speaker_count': len(set(seg['speaker_id'] for seg in processed_segments))
             }
             
@@ -238,6 +266,7 @@ class ARGlassesServer:
         print(f"[SERVER] New connection from {websocket.remote_address}")
         self.active_connections.add(websocket)
         
+        # No keep-alive needed - connection stays alive until user disconnects
         
         try:
             async for message in websocket:
@@ -333,9 +362,9 @@ class ARGlassesServer:
                             print(f"[SERVER] Segment {i+1}: {segment}")
                         
                         # Check if we're getting the expected processing method
-                        if result.get('processing_method') != 'optimized_diarization':
+                        if result.get('processing_method') != 'diarization':
                             print(f"[SERVER] WARNING: Unexpected processing method: {result.get('processing_method')}")
-                            print(f"[SERVER] Expected: optimized_diarization")
+                            print(f"[SERVER] Expected: diarization")
                             print(f"[SERVER] This indicates the processing is not working correctly!")
                         
                         # Save debug output
@@ -375,6 +404,56 @@ class ARGlassesServer:
                         print(f"[SERVER] Audio processing completed for {chunk_id}")
                         
                     
+                    elif message_type == "register_voice":
+                        # Handle voice registration
+                        voice_data = data.get("voice_data", "")
+                        sample_rate = data.get("sample_rate", 16000)
+                        
+                        print(f"[SERVER] Voice registration request received")
+                        print(f"[SERVER] Voice data length: {len(voice_data)} characters")
+                        
+                        # Generate unique voice ID
+                        voice_id = f"USER_VOICE_{int(time.time() * 1000)}"
+                        
+                        # Store voice data
+                        self.registered_voices[voice_id] = {
+                            "voice_data": voice_data,
+                            "sample_rate": sample_rate,
+                            "timestamp": time.time()
+                        }
+                        
+                        print(f"[SERVER] Voice registered with ID: {voice_id}")
+                        
+                        # Send confirmation
+                        response = {
+                            "type": "voice_registered",
+                            "voice_id": voice_id,
+                            "status_code": 200,
+                            "message": "Voice registered successfully",
+                            "timestamp": time.time()
+                        }
+                        await self._safe_send_message(websocket, response)
+                        
+                    elif message_type == "set_voice_exclusion":
+                        # Handle voice exclusion setting
+                        exclude_voice = data.get("exclude_voice", False)
+                        voice_id = data.get("voice_id", None)
+                        
+                        print(f"[SERVER] Voice exclusion setting: {exclude_voice}")
+                        if voice_id:
+                            print(f"[SERVER] Voice ID to exclude: {voice_id}")
+                            self.user_voice_exclusions[websocket] = voice_id if exclude_voice else None
+                        else:
+                            self.user_voice_exclusions[websocket] = None
+                        
+                        response = {
+                            "type": "voice_exclusion_set",
+                            "exclude_voice": exclude_voice,
+                            "status_code": 200,
+                            "timestamp": time.time()
+                        }
+                        await self._safe_send_message(websocket, response)
+                        
                     elif message_type == "ping":
                         # Respond to ping
                         response = {
@@ -409,8 +488,8 @@ class ARGlassesServer:
             self.handle_websocket,
             self.host,
             self.port,
-            ping_interval=None,    # Disable automatic pings (or use 60 for 1 minute)
-            ping_timeout=60,       # 60 second timeout for ping responses
+            ping_interval=None,    # Disable automatic pings - connection stays alive until user disconnects
+            ping_timeout=None,     # No ping timeout
             close_timeout=30,      # 30 second timeout for close handshake
             max_size=10**7,        # 10MB max message size (for larger audio files)
             max_queue=128,         # More queued messages
