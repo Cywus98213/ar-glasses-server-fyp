@@ -11,6 +11,7 @@ import torch
 import soundfile as sf
 from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
+from speechbrain.pretrained import EncoderClassifier
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -23,21 +24,10 @@ class DiarizationPipeline:
         
         os.environ["HF_TOKEN"] = hf_token
         
-        try:
-            self.diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token
-            )
-        except TypeError:
-            try:
-                self.diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    token=hf_token
-                )
-            except TypeError:
-                self.diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1"
-                )
+        self.diarization_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token
+        )
         
         # Configure diarization for better multi-speaker detection
         # Using correct parameter names for pyannote/speaker-diarization-3.1
@@ -64,6 +54,15 @@ class DiarizationPipeline:
             local_files_only=False
         )
         
+        # Initialize speaker embedding model (ECAPA-TDNN for 192-dim embeddings)
+        print("[DIARIZATION] Loading speaker embedding model...")
+        self.speaker_model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            run_opts={"device": device}
+        )
+        print("[DIARIZATION] Speaker embedding model loaded (192-dim ECAPA-TDNN)")
+        
         # Minimal cache for memory efficiency
         self.audio_cache = {}
         self.cache_lock = threading.Lock()
@@ -81,6 +80,57 @@ class DiarizationPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    def extract_speaker_embedding(self, audio_array: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
+        """
+        Extract 192-dimensional speaker embedding from audio.
+        This function can be called from ar_glasses_server to get embeddings for voice registration.
+        
+        Args:
+            audio_array: Audio as numpy array (float32, mono, normalized to [-1, 1])
+            sample_rate: Sample rate in Hz (default: 16000)
+            
+        Returns:
+            np.ndarray: 192-dimensional embedding, or None if failed
+            
+        Example:
+            embedding = diarization_pipeline.extract_speaker_embedding(audio_array, 16000)
+            # Returns: np.array with shape (192,)
+        """
+        try:
+            print(f"[DIARIZATION] Extracting 192-dim speaker embedding...")
+            print(f"[DIARIZATION] Audio: {len(audio_array)} samples at {sample_rate}Hz")
+            
+            # Ensure audio is mono
+            if len(audio_array.shape) > 1:
+                audio_array = audio_array.mean(axis=1)
+            
+            # Convert to float32
+            audio_array = audio_array.astype(np.float32)
+            
+            # Normalize to [-1, 1] range
+            if np.max(np.abs(audio_array)) > 0:
+                audio_array = audio_array / np.max(np.abs(audio_array))
+            
+            # Convert to torch tensor [1, samples]
+            audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)
+            
+            # Extract embedding using SpeechBrain ECAPA-TDNN
+            with torch.no_grad():
+                embedding = self.speaker_model.encode_batch(audio_tensor)
+                embedding = embedding.squeeze().cpu().numpy()  # Shape: (192,)
+            
+            print(f"[DIARIZATION] ✓ Embedding extracted successfully!")
+            print(f"[DIARIZATION] Embedding shape: {embedding.shape}")
+            print(f"[DIARIZATION] Embedding stats: mean={np.mean(embedding):.4f}, std={np.std(embedding):.4f}")
+            
+            return embedding
+            
+        except Exception as e:
+            print(f"[DIARIZATION] ERROR extracting embedding: {e}")
+            import traceback
+            print(f"[DIARIZATION] Traceback: {traceback.format_exc()}")
+            return None
         
     def _manage_cache(self):
         """Manage cache size to prevent memory overflow."""
@@ -102,23 +152,6 @@ class DiarizationPipeline:
         if np.max(np.abs(audio_segment)) > 0:
             audio_segment = audio_segment / np.max(np.abs(audio_segment))
         
-        # Apply gentle noise reduction (simple high-pass filter)
-        from scipy import signal
-        if len(audio_segment) > 100:
-            # High-pass filter to remove low-frequency noise
-            nyquist = sample_rate / 2
-            high = 80.0 / nyquist  # 80 Hz high-pass filter
-            b, a = signal.butter(4, high, btype='high')
-            audio_segment = signal.filtfilt(b, a, audio_segment)
-            # Ensure result is still float32
-            audio_segment = audio_segment.astype(np.float32)
-        
-        # Ensure proper length (Whisper works best with certain lengths)
-        min_length = int(0.5 * sample_rate)  # Minimum 0.5 seconds
-        if len(audio_segment) < min_length:
-            # Pad with silence
-            padding = np.zeros(min_length - len(audio_segment), dtype=np.float32)
-            audio_segment = np.concatenate([audio_segment, padding])
         
         return audio_segment
 
@@ -137,9 +170,6 @@ class DiarizationPipeline:
             # Combine all segments into one text
             text = " ".join([segment.text for segment in segments]).strip()
             
-            # Post-process to filter out repetitive text
-            text = self.filter_repetitive_text(text)
-            
             # Post-process for Cantonese output
             text = self.ensure_cantonese_output(text, info)
             
@@ -149,48 +179,41 @@ class DiarizationPipeline:
             print(f"[DIARIZATION] Error transcribing segment: {e}")
             return ""
 
-
-    def filter_repetitive_text(self, text: str) -> str:
-        """Filter out repetitive text patterns that indicate poor transcription."""
-        if not text:
-            return text
+    def compare_embeddings(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+        """
+        Compare two speaker embeddings using cosine similarity.
         
-        # For Cantonese, be more lenient with short text
-        # Cantonese words are often 1-2 characters, so don't filter aggressively
-        
-        # Split into words
-        words = text.split()
-        
-        # Only filter if we have many words (more than 5) and clear repetition
-        if len(words) > 5:
-            # Check for repetitive patterns
-            word_counts = {}
-            for word in words:
-                word_counts[word] = word_counts.get(word, 0) + 1
+        Args:
+            embedding1: First embedding (192-dim)
+            embedding2: Second embedding (192-dim)
             
-            # If more than 70% of words are the same, it's likely repetitive
-            max_count = max(word_counts.values())
-            if max_count > len(words) * 0.7:
-                # Return only the first occurrence of each unique word
-                unique_words = []
-                seen = set()
-                for word in words:
-                    if word not in seen:
-                        unique_words.append(word)
-                        seen.add(word)
-                text = " ".join(unique_words)
-        
-        # Don't filter out short Cantonese text - it's often valid
-        # Only filter if it's clearly repetitive (same word repeated many times)
-        if len(words) <= 3:
-            # For short text, only filter if it's the same word repeated
-            if len(set(words)) == 1 and len(words) > 2:
-                return words[0]  # Return just one instance
-            else:
-                return text  # Keep short text as-is
-        
-        return text
-
+        Returns:
+            float: Cosine similarity score (0-1), where higher means more similar
+        """
+        try:
+            # Ensure embeddings are 1D
+            emb1 = embedding1.flatten()
+            emb2 = embedding2.flatten()
+            
+            # Compute cosine similarity
+            dot_product = np.dot(emb1, emb2)
+            norm1 = np.linalg.norm(emb1)
+            norm2 = np.linalg.norm(emb2)
+            
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+            
+            similarity = dot_product / (norm1 * norm2)
+            
+            # Ensure similarity is in [0, 1] range
+            similarity = np.clip(similarity, 0.0, 1.0)
+            
+            return float(similarity)
+            
+        except Exception as e:
+            print(f"[DIARIZATION] Error comparing embeddings: {e}")
+            return 0.0
+    
     def ensure_cantonese_output(self, text: str, info) -> str:
         """Ensure the output is in Cantonese characters, not English."""
         if not text:
@@ -217,10 +240,30 @@ class DiarizationPipeline:
         # Return the text as-is for now, but log the issue
         return text
 
-    def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000) -> Dict[str, Any]:
-        """Process audio array for speaker diarization and transcription (optimized)."""
+    def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000, registered_voices: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Process audio array for speaker diarization and transcription.
+        
+        Args:
+            audio_array: Audio data as numpy array
+            sample_rate: Sample rate in Hz
+            registered_voices: Dictionary of registered voice embeddings {voice_id: {'embedding': np.array, ...}}
+        """
         try:
             print(f"[DIARIZATION] Processing audio array: {len(audio_array)} samples, {sample_rate} Hz")
+            
+            # Debug: Check what we received
+            print(f"[DIARIZATION] DEBUG: registered_voices parameter = {type(registered_voices)}")
+            print(f"[DIARIZATION] DEBUG: registered_voices is None? {registered_voices is None}")
+            if registered_voices:
+                print(f"[DIARIZATION] DEBUG: registered_voices keys = {list(registered_voices.keys())}")
+                print(f"[DIARIZATION] DEBUG: Number of voices = {len(registered_voices)}")
+            
+            # Check if we have a registered voice (wearer's voice)
+            has_registered_voice = registered_voices and len(registered_voices) > 0
+            if has_registered_voice:
+                print(f"[DIARIZATION] ✓ Registered voice detected - will identify wearer's segments")
+            else:
+                print(f"[DIARIZATION] ✗ No registered voice - processing normally")
             
             # Ensure audio is mono and float32
             if len(audio_array.shape) > 1:
@@ -232,15 +275,6 @@ class DiarizationPipeline:
             if np.max(np.abs(audio_array)) > 0:
                 audio_array = audio_array / np.max(np.abs(audio_array))
             
-            # Apply gentle noise reduction
-            from scipy import signal
-            if len(audio_array) > 100:
-                # High-pass filter to remove low-frequency noise
-                nyquist = sample_rate / 2
-                high = 80.0 / nyquist  # 80 Hz high-pass filter
-                b, a = signal.butter(4, high, btype='high')
-                audio_array = signal.filtfilt(b, a, audio_array)
-                audio_array = audio_array.astype(np.float32)
             
             print(f"[DIARIZATION] Audio preprocessed: {len(audio_array)} samples, max={np.max(audio_array):.3f}")
             
@@ -358,24 +392,78 @@ class DiarizationPipeline:
                         skipped_empty += 1
                         continue
                     
-                    # OPTIMIZATION 6: Filter out common noise patterns
-                    # text_lower = text.lower().strip()
-                    # noise_patterns = ["um", "uh", "ah", "eh", "oh", "mm", "hmm", "background", "noise", "static", "silence", "breathing"]
-                    # if text_lower in noise_patterns:
-                    #     continue
+                    # Filter out hallucination text from the segment (not the whole segment)
+                    hallucination_patterns = [
+                        "字幕由 Amara.org 社群提供",
+                        "字幕由Amara.org社群提供",
+                        "Amara.org",
+                        "字幕由",
+                        "社群提供",
+                        "中文字幕",
+                        "李宗盛",
+                    ]
                     
-                    # Add segment
-                    segments.append({
+                    original_text = text
+                    for pattern in hallucination_patterns:
+                        if pattern in text:
+                            text = text.replace(pattern, "").strip()
+                            print(f"[DIARIZATION] Removed hallucination '{pattern}' from segment")
+                    
+                    # Clean up spacing
+                    text = " ".join(text.split())
+                    
+                    # If after removing hallucinations there's nothing left, skip the segment
+                    if not text or len(text.strip()) < 1:
+                        print(f"[DIARIZATION] Segment was entirely hallucination: '{original_text}'")
+                        skipped_empty += 1
+                        continue
+                    
+                    # Compare with registered voice if available
+                    is_wearer = False
+                    voice_similarity = 0.0
+                    
+                    if has_registered_voice:
+                        # Extract embedding from this segment
+                        segment_embedding = self.extract_speaker_embedding(segment_audio, sample_rate)
+                        
+                        if segment_embedding is not None:
+                            # Get the wearer's registered voice (only one voice)
+                            voice_id, voice_data = next(iter(registered_voices.items()))
+                            registered_embedding = voice_data.get('embedding')
+                            
+                            if registered_embedding is not None:
+                                similarity = self.compare_embeddings(segment_embedding, registered_embedding)
+                                voice_similarity = similarity
+                                print(f"[DIARIZATION] Similarity with wearer's voice: {similarity:.3f}")
+                                
+                                if similarity > 0.75:
+                                    is_wearer = True
+                                    print(f"[DIARIZATION] ✓ Segment identified as WEARER (similarity: {similarity:.3f})")
+                                else:
+                                    print(f"[DIARIZATION] → Segment is OTHER speaker (similarity: {similarity:.3f})")
+                    
+                    # Add segment with voice matching info
+                    segment_data = {
                         'speaker_id': speaker,
                         'transcription': text,
                         'start': start_time,
                         'end': end_time,
                         'duration': duration,
                         'confidence': 0.9  # Default confidence for optimized processing
-                    })
+                    }
+                    
+                    # Add voice matching results if wearer's voice is registered
+                    if has_registered_voice:
+                        segment_data['is_wearer'] = is_wearer
+                        segment_data['voice_similarity'] = voice_similarity
+                    
+                    segments.append(segment_data)
                     
                     segment_count += 1
-                    print(f"[DIARIZATION] Added segment {segment_count}: {speaker} - '{text[:50]}{'...' if len(text) > 50 else ''}'")
+                    if is_wearer:
+                        print(f"[DIARIZATION] Added segment {segment_count}: {speaker} [WEARER] - '{text[:50]}{'...' if len(text) > 50 else ''}'")
+                    else:
+                        print(f"[DIARIZATION] Added segment {segment_count}: {speaker} [OTHER] - '{text[:50]}{'...' if len(text) > 50 else ''}'")
                 
                 print(f"[DIARIZATION] Processing complete: {len(segments)} valid segments found")
                 print(f"[DIARIZATION] Filtering summary:")

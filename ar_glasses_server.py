@@ -69,9 +69,9 @@ class ARGlassesServer:
         self.active_connections = set()
         self.main_loop = None
         
-        # Voice registration storage
-        self.registered_voices = {}  # voice_id -> voice_data
-        self.user_voice_exclusions = {}  # connection -> voice_id to exclude
+        # Voice registration storage - stores wearer's voice (192-dim embedding)
+        # Only one voice at a time (the glasses wearer)
+        self.registered_voices = {}  # voice_id -> {'embedding': np.array(192,), 'timestamp': float, 'sample_rate': int}
         
         self.debug_json_dir = Path("debug_json_output")
         self.debug_json_dir.mkdir(exist_ok=True)
@@ -88,25 +88,6 @@ class ARGlassesServer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    def _should_exclude_speaker(self, speaker_id, audio_array, sample_rate):
-        """Check if a speaker should be excluded based on voice registration."""
-        # For now, implement a simple check - in a real implementation,
-        # you would compare the speaker's voice characteristics with registered voices
-        # This is a placeholder for the voice matching logic
-        
-        # Check if any connection has voice exclusion enabled
-        for connection in self.active_connections:
-            if connection in self.user_voice_exclusions:
-                excluded_voice_id = self.user_voice_exclusions[connection]
-                if excluded_voice_id and excluded_voice_id in self.registered_voices:
-                    # Here you would implement actual voice matching
-                    # For now, we'll do a simple check based on speaker ID patterns
-                    if speaker_id.startswith("SPEAKER_00") or speaker_id == "SPEAKER_0":
-                        print(f"[SERVER] Voice exclusion: Speaker {speaker_id} matches exclusion pattern")
-                        return True
-        
-        return False
 
 
     def load_environment(self):
@@ -181,7 +162,19 @@ class ARGlassesServer:
             
             # Use only diarization pipeline (includes speaker detection and transcription)
             print("[SERVER] Running diarization pipeline...")
-            diarization_result = self.diarization_pipeline.process_audio_array(audio_array, sample_rate)
+            print(f"[SERVER] DEBUG: self.registered_voices = {list(self.registered_voices.keys()) if self.registered_voices else 'None'}")
+            if self.registered_voices:
+                print(f"[SERVER] ✓ Wearer's voice registered - will identify wearer vs others")
+                for voice_id, voice_data in self.registered_voices.items():
+                    print(f"[SERVER] DEBUG: Voice ID: {voice_id}")
+                    print(f"[SERVER] DEBUG: Embedding shape: {voice_data['embedding'].shape if voice_data.get('embedding') is not None else 'None'}")
+            else:
+                print(f"[SERVER] ✗ No registered voice - processing all speakers normally")
+            diarization_result = self.diarization_pipeline.process_audio_array(
+                audio_array, 
+                sample_rate,
+                registered_voices=self.registered_voices
+            )
             print(f"[SERVER] Diarization result: {diarization_result}")
             print(f"[SERVER] Processing method: {diarization_result.get('processing_method', 'unknown') if diarization_result else 'None'}")
             
@@ -217,22 +210,29 @@ class ARGlassesServer:
                 speaker_id = segment.get('speaker_id', f'SPEAKER_{i:02d}')
                 text = segment.get('transcription', segment.get('text', ''))
                 
-                # Check if this speaker should be excluded (voice exclusion feature)
-                should_exclude = self._should_exclude_speaker(speaker_id, audio_array, sample_rate)
-                if should_exclude:
-                    print(f"[SERVER] Excluding segment from registered user voice: {speaker_id}")
-                    continue
-                
-                processed_segments.append({
+                # Build segment data
+                segment_data = {
                     'speaker_id': speaker_id,
                     'text': text,
                     'start': segment.get('start', 0.0),
                     'end': segment.get('end', 0.0),
                     'duration': segment.get('duration', 0.0),
                     'confidence': segment.get('confidence', 0.8)
-                })
+                }
                 
-                print(f"[SERVER] Segment {i+1}: {speaker_id} - '{text}'")
+                # Add voice matching info if available (wearer identification)
+                if 'is_wearer' in segment:
+                    segment_data['is_wearer'] = segment.get('is_wearer')
+                    segment_data['voice_similarity'] = segment.get('voice_similarity', 0.0)
+                
+                processed_segments.append(segment_data)
+                
+                # Enhanced logging with wearer indicator
+                wearer_marker = "[WEARER]" if segment.get('is_wearer') else "[OTHER]"
+                if 'is_wearer' in segment:
+                    print(f"[SERVER] Segment {i+1}: {speaker_id} {wearer_marker} - '{text}'")
+                else:
+                    print(f"[SERVER] Segment {i+1}: {speaker_id} - '{text}'")
             
             result = {
                 'segments': processed_segments,
@@ -265,9 +265,6 @@ class ARGlassesServer:
         """Handle WebSocket connections."""
         print(f"[SERVER] New connection from {websocket.remote_address}")
         self.active_connections.add(websocket)
-        
-        # No keep-alive needed - connection stays alive until user disconnects
-        
         try:
             async for message in websocket:
                 try:
@@ -405,54 +402,76 @@ class ARGlassesServer:
                         
                     
                     elif message_type == "register_voice":
-                        # Handle voice registration
+                        # Register the wearer's voice (only one voice at a time)
+                        # Clear any previously registered voice
+                        self.registered_voices.clear()
+
                         voice_data = data.get("voice_data", "")
                         sample_rate = data.get("sample_rate", 16000)
-                        
-                        print(f"[SERVER] Voice registration request received")
-                        print(f"[SERVER] Voice data length: {len(voice_data)} characters")
-                        
-                        # Generate unique voice ID
-                        voice_id = f"USER_VOICE_{int(time.time() * 1000)}"
-                        
-                        # Store voice data
-                        self.registered_voices[voice_id] = {
-                            "voice_data": voice_data,
-                            "sample_rate": sample_rate,
-                            "timestamp": time.time()
-                        }
-                        
-                        print(f"[SERVER] Voice registered with ID: {voice_id}")
-                        
-                        # Send confirmation
-                        response = {
-                            "type": "voice_registered",
-                            "voice_id": voice_id,
-                            "status_code": 200,
-                            "message": "Voice registered successfully",
-                            "timestamp": time.time()
-                        }
-                        await self._safe_send_message(websocket, response)
-                        
-                    elif message_type == "set_voice_exclusion":
-                        # Handle voice exclusion setting
-                        exclude_voice = data.get("exclude_voice", False)
-                        voice_id = data.get("voice_id", None)
-                        
-                        print(f"[SERVER] Voice exclusion setting: {exclude_voice}")
-                        if voice_id:
-                            print(f"[SERVER] Voice ID to exclude: {voice_id}")
-                            self.user_voice_exclusions[websocket] = voice_id if exclude_voice else None
-                        else:
-                            self.user_voice_exclusions[websocket] = None
-                        
-                        response = {
-                            "type": "voice_exclusion_set",
-                            "exclude_voice": exclude_voice,
-                            "status_code": 200,
-                            "timestamp": time.time()
-                        }
-                        await self._safe_send_message(websocket, response)
+                        try:
+                            # Decode audio from base64
+                            print("[SERVER] ==========================================")
+                            print("[SERVER] Registering WEARER's voice...")
+                            print("[SERVER] Decoding audio...")
+                            audio_bytes = base64.b64decode(voice_data)
+                            audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                            print(f"[SERVER] Decoded {len(audio_array)} samples")
+                            
+                            # Extract 192-dim embedding using diarization pipeline
+                            embedding = self.diarization_pipeline.extract_speaker_embedding(audio_array, sample_rate)
+                            
+                            if embedding is None or embedding.shape[0] != 192:
+                                print(f"[SERVER] ERROR: Failed to extract valid 192-dim embedding!")
+                                response = {
+                                    "type": "voice_registered",
+                                    "status_code": 500,
+                                    "message": "Failed to extract speaker embedding",
+                                    "timestamp": time.time()
+                                }
+                                await self._safe_send_message(websocket, response)
+                                continue
+                            
+                            # Generate unique voice ID for the wearer
+                            voice_id = f"WEARER_VOICE_{int(time.time() * 1000)}"
+                            
+                            # Save the wearer's 192-dim embedding (only one voice)
+                            self.registered_voices[voice_id] = {
+                                "embedding": embedding,
+                                "timestamp": time.time(),
+                                "sample_rate": sample_rate
+                            }
+
+                            
+                            print(f"[SERVER] ✓ Wearer's voice registered successfully!")
+                            print(f"[SERVER] Voice ID: {voice_id}")
+                            print(f"[SERVER] Embedding shape: {embedding.shape}")
+                            print(f"[SERVER] DEBUG: self.registered_voices after registration = {list(self.registered_voices.keys())}")
+                            print(f"[SERVER] DEBUG: Number of registered voices = {len(self.registered_voices)}")
+                            print(f"[SERVER] Will identify wearer in future conversations")
+                            print(f"[SERVER] ==========================================")
+                            
+                            # Send confirmation
+                            response = {
+                                "type": "voice_registered",
+                                "voice_id": voice_id,
+                                "status_code": 200,
+                                "message": "Wearer's voice registered with 192-dim embedding",
+                                "embedding_shape": list(embedding.shape),
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, response)
+                            
+                        except Exception as e:
+                            print(f"[SERVER] ERROR during voice registration: {e}")
+                            import traceback
+                            print(f"[SERVER] Traceback: {traceback.format_exc()}")
+                            response = {
+                                "type": "voice_registered",
+                                "status_code": 500,
+                                "message": f"Registration failed: {str(e)}",
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, response)
                         
                     elif message_type == "ping":
                         # Respond to ping
