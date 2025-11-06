@@ -45,11 +45,14 @@ class DiarizationPipeline:
         try:
             self.diarization_pipeline.instantiate({
                 "clustering": {
-                    "threshold": 0.3,  # Lower threshold for better detection
-                    "min_cluster_size": 1,  # Allow single segments
+                    "threshold": 0.5,  # Higher threshold to reduce false speakers (was 0.3)
+                    "min_cluster_size": 2,  # Require at least 2 segments per speaker (was 1)
+                },
+                "segmentation": {
+                    "min_duration_off": 0.5,  # Minimum silence between speakers
                 }
             })
-            print("[DIARIZATION] Diarization configured for better multi-speaker detection")
+            print("[DIARIZATION] Diarization configured to reduce false speakers")
         except Exception as e:
             print(f"[DIARIZATION] Warning: Could not configure diarization parameters: {e}")
             print("[DIARIZATION] Using default diarization settings")
@@ -574,9 +577,9 @@ class DiarizationPipeline:
                     end_time = turn.end
                     duration = end_time - start_time
                     
-                    # OPTIMIZATION 1: Skip very short segments (more lenient for multi-speaker)
-                    if duration < 0.05:  # Very lenient - only skip extremely short segments
-                        print(f"[OPTIMIZED] Skipping very short segment: {duration:.2f}s")
+                    # OPTIMIZATION 1: Skip very short segments (prevents noise/hallucination speakers)
+                    if duration < 0.3:  # Increased from 0.05s to 0.3s - skip very short segments
+                        print(f"[OPTIMIZED] Skipping very short segment: {duration:.2f}s (likely noise)")
                         skipped_short += 1
                         continue
                     
@@ -593,10 +596,10 @@ class DiarizationPipeline:
                     if len(segment_audio) == 0:
                         continue
                     
-                    # Calculate RMS energy
+                    # Calculate RMS energy (skip quiet segments that are likely noise)
                     rms_energy = np.sqrt(np.mean(segment_audio**2))
-                    if rms_energy < 0.0005:  # Very low threshold - only skip extremely quiet segments
-                        print(f"[OPTIMIZED] Skipping low energy segment: {rms_energy:.4f}")
+                    if rms_energy < 0.002:  # Increased from 0.0005 to 0.002 - skip quiet segments
+                        print(f"[OPTIMIZED] Skipping low energy segment: {rms_energy:.6f} (likely background noise)")
                         skipped_energy += 1
                         continue
                     
@@ -645,8 +648,9 @@ class DiarizationPipeline:
                     # Extract text from result
                     text = transcription_result.get('text', '') if transcription_result else ''
                     
-                    #  Filter out empty or very short transcriptions
-                    if not text or len(text.strip()) < 1:  # Very lenient - only skip completely empty
+                    # Filter out empty or very short transcriptions
+                    if not text or len(text.strip()) < 2:  # Increased from 1 to 2 - skip single character
+                        print(f"[OPTIMIZED] Skipping empty/short text: '{text}'")
                         skipped_empty += 1
                         continue
                     
@@ -659,6 +663,11 @@ class DiarizationPipeline:
                         "社群提供",
                         "中文字幕",
                         "李宗盛",
+                        "嗯",  # Um/uh sounds
+                        "啊",  # Ah sounds
+                        "呃",  # Uh sounds
+                        "哦",  # Oh sounds
+                        "喔",  # Oh sounds (variant)
                     ]
                     
                     original_text = text
@@ -671,8 +680,14 @@ class DiarizationPipeline:
                     text = " ".join(text.split())
                     
                     # If after removing hallucinations there's nothing left, skip the segment
-                    if not text or len(text.strip()) < 1:
-                        print(f"[DIARIZATION] Segment was entirely hallucination: '{original_text}'")
+                    if not text or len(text.strip()) < 2:
+                        print(f"[DIARIZATION] Segment was entirely hallucination/noise: '{original_text}'")
+                        skipped_empty += 1
+                        continue
+                    
+                    # Additional filter: Skip if text is only punctuation or symbols
+                    if text.strip() and all(not c.isalnum() for c in text.strip()):
+                        print(f"[DIARIZATION] Skipping non-alphanumeric text: '{text}'")
                         skipped_empty += 1
                         continue
                     
