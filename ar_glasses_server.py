@@ -28,24 +28,38 @@ class ARGlassesServer:
         """Initialize the AR Glasses server with speaker recognition."""
         print("[SERVER] Initializing AR Glasses Server...")
         
-        # Force CPU for memory efficiency on Render
-        self.device = "cpu"
-        print(f"[SERVER] Using device: {self.device} (forced CPU for memory efficiency)")
+        # Load environment from config.env 
+        self._load_env_files()
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+
+        print(f"[SERVER] Using device: {self.device}")
         
-        self.load_environment()
-        
+        # Load basic settings from env
         self.hf_token = os.getenv("HF_TOKEN")
+        self.transcription_language = os.getenv("TRANSCRIPTION_LANGUAGE", "zh")
+        self.translation_language = None  # Will be set by app request (handle_request)
+
         if not self.hf_token:
-            print("[SERVER] Warning: HF_TOKEN not found in environment. Using fallback models.")
-            self.hf_token = "hf_your_token_here"
+            print("[SERVER] Warning: HF_TOKEN not found in environment, please set it in the config.env file.")
+            sys.exit(1)
+        
+        print(f"[SERVER] Default transcription language: {self.transcription_language}")
+        print("[SERVER] Translation language will be set by app requests")
         
         print("[SERVER] Loading diarization model...")
-        print(f"[SERVER] Using HF_TOKEN: {self.hf_token[:10]}..." if self.hf_token else "[SERVER] No HF_TOKEN provided")
         
         try:
             # Initialize only diarization pipeline for faster processing
             print("[SERVER] Initializing Diarization Pipeline...")
-            self.diarization_pipeline = DiarizationPipeline(self.hf_token)
+
+            # loading the model thru the hugging face token
+            # Pass default transcription language to diarization pipeline
+            # Translation language will be provided per request
+            self.diarization_pipeline = DiarizationPipeline(
+                self.hf_token
+            )
             print("[SERVER] Diarization pipeline loaded successfully")
             
             print("[SERVER] Model loaded successfully!")
@@ -75,6 +89,7 @@ class ARGlassesServer:
         
         self.debug_json_dir = Path("debug_json_output")
         self.debug_json_dir.mkdir(exist_ok=True)
+
         self._clear_debug_output()
         
         # Memory management
@@ -90,23 +105,6 @@ class ARGlassesServer:
             torch.cuda.empty_cache()
 
 
-    def load_environment(self):
-        """Load environment variables from config.env file, but prioritize existing env vars."""
-        env_file = "config.env"
-        if os.path.exists(env_file):
-            print(f"[SERVER] Loading environment from {env_file}")
-            with open(env_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        # Only set if not already in environment (prioritize Docker env vars)
-                        if key.strip() not in os.environ:
-                            os.environ[key.strip()] = value.strip()
-            print("[SERVER] Environment variables loaded successfully")
-        else:
-            print(f"[SERVER] Warning: {env_file} not found, using system environment variables")
-
     def _clear_debug_output(self):
         """Clear debug output directory."""
         try:
@@ -115,6 +113,19 @@ class ARGlassesServer:
             print("[SERVER] Cleared debug output directory")
         except Exception as e:
             print(f"[SERVER] Warning: Could not clear debug output: {e}")
+
+    def _load_env_files(self):
+        """Load environment from config.env"""
+        if os.path.exists('config.env'):
+            with open('config.env', 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ[key.strip()] = value.strip()
+            print("[SERVER] Environment variables loaded successfully")
+        else:
+            print("[SERVER] Warning: config.env not found, using OS environment only")
 
     def _save_json_output(self, message_type: str, message: Dict[str, Any]):
         """Save JSON output to file for debugging."""
@@ -134,7 +145,7 @@ class ARGlassesServer:
     async def _safe_send_message(self, websocket, message: Dict[str, Any]):
         """Safely send message to WebSocket."""
         try:
-            # Check if connection is open using the new API
+            # Check if connection is open
             if hasattr(websocket, 'state'):
                 from websockets.protocol import State
                 if websocket.state == State.OPEN:
@@ -143,15 +154,12 @@ class ARGlassesServer:
                 else:
                     print(f"[SERVER] Cannot send message - WebSocket state: {websocket.state}")
                     return False
-            else:
-                # Fallback - just try to send
-                await websocket.send(json.dumps(message))
-                return True
+            
         except Exception as e:
             print(f"[SERVER] Error sending message: {e}")
             return False
 
-    def process_audio(self, audio_array: np.ndarray, sample_rate: int) -> dict:
+    def process_audio(self, audio_array: np.ndarray, sample_rate: int, translation_language: str) -> dict:
         """Process audio using diarization only (faster processing)."""
         try:
             print(f"[SERVER] PROCESSING AUDIO: {len(audio_array)} samples at {sample_rate}Hz")
@@ -163,17 +171,23 @@ class ARGlassesServer:
             # Use only diarization pipeline (includes speaker detection and transcription)
             print("[SERVER] Running diarization pipeline...")
             print(f"[SERVER] DEBUG: self.registered_voices = {list(self.registered_voices.keys()) if self.registered_voices else 'None'}")
+
+            # check if the wearer's voice is registered
             if self.registered_voices:
-                print(f"[SERVER] ✓ Wearer's voice registered - will identify wearer vs others")
+                print(f"[SERVER] Wearer's voice registered - will identify wearer vs others")
                 for voice_id, voice_data in self.registered_voices.items():
                     print(f"[SERVER] DEBUG: Voice ID: {voice_id}")
                     print(f"[SERVER] DEBUG: Embedding shape: {voice_data['embedding'].shape if voice_data.get('embedding') is not None else 'None'}")
             else:
-                print(f"[SERVER] ✗ No registered voice - processing all speakers normally")
+                print(f"[SERVER] No registered voice - processing all speakers normally")
+
+            # pack the audio result with dynamic language settings
             diarization_result = self.diarization_pipeline.process_audio_array(
                 audio_array, 
                 sample_rate,
-                registered_voices=self.registered_voices
+                registered_voices=self.registered_voices,
+                transcription_lang=self.transcription_language,
+                translation_lang=translation_language
             )
             print(f"[SERVER] Diarization result: {diarization_result}")
             print(f"[SERVER] Processing method: {diarization_result.get('processing_method', 'unknown') if diarization_result else 'None'}")
@@ -199,7 +213,7 @@ class ARGlassesServer:
                     'error': 'No speech segments detected'
                 }
             
-            # Process segments directly from diarization (no need for additional speaker recognition)
+            # Process segments directly from diarization
             print("[SERVER] Processing segments from diarization...")
             processed_segments = []
             
@@ -227,7 +241,7 @@ class ARGlassesServer:
                 
                 processed_segments.append(segment_data)
                 
-                # Enhanced logging with wearer indicator
+                # log if the segment is the wearer voice
                 wearer_marker = "[WEARER]" if segment.get('is_wearer') else "[OTHER]"
                 if 'is_wearer' in segment:
                     print(f"[SERVER] Segment {i+1}: {speaker_id} {wearer_marker} - '{text}'")
@@ -274,11 +288,18 @@ class ARGlassesServer:
                     print(f"[SERVER] Received: {message_type}")
                     
                     if message_type == "join_conversation":
-                        # Send confirmation
+                        # allow client to set language at session start
+                        client_translation_lang = data.get("translation_language")
+                        
+                        if client_translation_lang:
+                            self.translation_language = client_translation_lang
+                            print(f"[SERVER] Translation language set by client: {self.translation_language}")
+                        
                         response = {
                             "type": "conversation_joined",
                             "status_code": 200,
                             "message": "Successfully joined conversation",
+                            "translation_language": self.translation_language,
                             "timestamp": time.time()
                         }
                         await self._safe_send_message(websocket, response)
@@ -301,6 +322,7 @@ class ARGlassesServer:
                         chunk_id = data.get("chunk_id", "unknown")
                         audio_data = data.get("audio_data", "")
                         sample_rate = data.get("sample_rate", 16000)
+                        translation_language = data.get("translation_language", None)
                         
                         print(f"\n{'='*60}")
                         print(f"[SERVER] AUDIO PROCESSING STARTED")
@@ -347,8 +369,10 @@ class ARGlassesServer:
                         print(f"[SERVER] Audio array shape: {audio_array.shape}")
                         print(f"[SERVER] Audio array dtype: {audio_array.dtype}")
                         print(f"[SERVER] Audio array range: [{np.min(audio_array):.4f}, {np.max(audio_array):.4f}]")
+                        print(f"[SERVER] Using transcription language: {self.transcription_language}")
+                        print(f"[SERVER] Using translation language: {translation_language or 'None'}")
                         
-                        result = self.process_audio(audio_array, sample_rate)
+                        result = self.process_audio(audio_array, sample_rate, translation_language)
                         
                         print(f"[SERVER] Processing result: {result}")
                         print(f"[SERVER] Processing method: {result.get('processing_method', 'unknown')}")
@@ -402,7 +426,8 @@ class ARGlassesServer:
                         
                     
                     elif message_type == "register_voice":
-                        # Register the wearer's voice (only one voice at a time)
+                        # Register the wearer's voice 
+
                         # Clear any previously registered voice
                         self.registered_voices.clear()
 
@@ -411,43 +436,60 @@ class ARGlassesServer:
                         try:
                             # Decode audio from base64
                             print("[SERVER] ==========================================")
-                            print("[SERVER] Registering WEARER's voice...")
+                            print("[SERVER] Registering WEARER's voice with MULTI-SAMPLE...")
                             print("[SERVER] Decoding audio...")
                             audio_bytes = base64.b64decode(voice_data)
                             audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                            print(f"[SERVER] Decoded {len(audio_array)} samples")
+                            duration_sec = len(audio_array) / sample_rate
+                            print(f"[SERVER] Decoded {len(audio_array)} samples ({duration_sec:.2f}s)")
                             
-                            # Extract 192-dim embedding using diarization pipeline
-                            embedding = self.diarization_pipeline.extract_speaker_embedding(audio_array, sample_rate)
+                            # Extract MULTIPLE 192-dim embeddings from segments
+                            embeddings = self.diarization_pipeline.extract_multiple_embeddings(audio_array, sample_rate)
                             
-                            if embedding is None or embedding.shape[0] != 192:
-                                print(f"[SERVER] ERROR: Failed to extract valid 192-dim embedding!")
+                            if embeddings is None or len(embeddings) == 0:
+                                print(f"[SERVER] ERROR: Failed to extract valid embeddings!")
                                 response = {
                                     "type": "voice_registered",
                                     "status_code": 500,
-                                    "message": "Failed to extract speaker embedding",
+                                    "message": "Failed to extract speaker embeddings",
                                     "timestamp": time.time()
                                 }
                                 await self._safe_send_message(websocket, response)
                                 continue
                             
-                            # Generate unique voice ID for the wearer
+                            # Validate all embeddings
+                            valid_embeddings = [emb for emb in embeddings if emb.shape[0] == 192]
+                            
+                            if len(valid_embeddings) == 0:
+                                print(f"[SERVER] ERROR: No valid 192-dim embeddings!")
+                                response = {
+                                    "type": "voice_registered",
+                                    "status_code": 500,
+                                    "message": "No valid embeddings extracted",
+                                    "timestamp": time.time()
+                                }
+                                await self._safe_send_message(websocket, response)
+                                continue
+                            
+                            # wearer id
                             voice_id = f"WEARER_VOICE_{int(time.time() * 1000)}"
                             
-                            # Save the wearer's 192-dim embedding (only one voice)
+                            # Save the wearer's MULTIPLE 192-dim embeddings
                             self.registered_voices[voice_id] = {
-                                "embedding": embedding,
+                                "embeddings": valid_embeddings,  # List of embeddings
+                                "num_samples": len(valid_embeddings),
                                 "timestamp": time.time(),
                                 "sample_rate": sample_rate
                             }
 
                             
-                            print(f"[SERVER] ✓ Wearer's voice registered successfully!")
+                            print(f"[SERVER] ✓✓ Wearer's voice registered with MULTI-SAMPLE!")
                             print(f"[SERVER] Voice ID: {voice_id}")
-                            print(f"[SERVER] Embedding shape: {embedding.shape}")
+                            print(f"[SERVER] Number of samples: {len(valid_embeddings)}")
+                            print(f"[SERVER] Each embedding shape: (192,)")
+                            print(f"[SERVER] Registration method: Multi-sample (robust)")
                             print(f"[SERVER] DEBUG: self.registered_voices after registration = {list(self.registered_voices.keys())}")
-                            print(f"[SERVER] DEBUG: Number of registered voices = {len(self.registered_voices)}")
-                            print(f"[SERVER] Will identify wearer in future conversations")
+                            print(f"[SERVER] Will identify wearer using multi-sample matching")
                             print(f"[SERVER] ==========================================")
                             
                             # Send confirmation
@@ -455,8 +497,9 @@ class ARGlassesServer:
                                 "type": "voice_registered",
                                 "voice_id": voice_id,
                                 "status_code": 200,
-                                "message": "Wearer's voice registered with 192-dim embedding",
-                                "embedding_shape": list(embedding.shape),
+                                "message": f"Wearer's voice registered with {len(valid_embeddings)} samples (multi-sample)",
+                                "num_samples": len(valid_embeddings),
+                                "registration_method": "multi-sample",
                                 "timestamp": time.time()
                             }
                             await self._safe_send_message(websocket, response)
@@ -490,12 +533,16 @@ class ARGlassesServer:
                 except Exception as e:
                     print(f"[SERVER] Error handling message: {e}")
                     
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as e:
             print(f"[SERVER] Connection closed: {websocket.remote_address}")
+            print(f"[SERVER] Close code: {e.code}, reason: {e.reason}")
         except Exception as e:
             print(f"[SERVER] WebSocket error: {e}")
+            import traceback
+            print(f"[SERVER] Error traceback: {traceback.format_exc()}")
         finally:
             self.active_connections.discard(websocket)
+            print(f"[SERVER] Cleaned up connection from {websocket.remote_address}")
 
     async def start_server(self):
         """Start the WebSocket server."""
@@ -507,8 +554,8 @@ class ARGlassesServer:
             self.handle_websocket,
             self.host,
             self.port,
-            ping_interval=None,    # Disable automatic pings - connection stays alive until user disconnects
-            ping_timeout=None,     # No ping timeout
+            ping_interval=20,      # Send ping every 20 seconds to keep connection alive
+            ping_timeout=60,       # Wait 60 seconds for pong response (long processing time)
             close_timeout=30,      # 30 second timeout for close handshake
             max_size=10**7,        # 10MB max message size (for larger audio files)
             max_queue=128,         # More queued messages
@@ -518,7 +565,7 @@ class ARGlassesServer:
         ):
             print(f"[SERVER] Server running on ws://{self.host}:{self.port}")
             print("[SERVER] Press Ctrl+C to stop")
-            await asyncio.Future()  # Run forever
+            await asyncio.Future() 
 
 def main():
     """Main function."""

@@ -12,24 +12,35 @@ import soundfile as sf
 from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
 from speechbrain.pretrained import EncoderClassifier
+from translation_module import TranslationModule
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 class DiarizationPipeline:
-    def __init__(self, hf_token: str):
-        """Initialize the diarization pipeline with performance improvements."""
+    def __init__(self, hf_token: str, transcription_lang: str = "zh"):
+        """Initialize the diarization pipeline with performance improvements.
+        
+        Args:
+            hf_token: HuggingFace API token
+            transcription_lang: Language code for transcription (default: 'zh' for Chinese)
+        """
         print("[DIARIZATION] Initializing Diarization Pipeline...")
         
         os.environ["HF_TOKEN"] = hf_token
+        
+        # Store default transcription language
+        self.transcription_lang = transcription_lang
+        
+        print(f"[DIARIZATION] Default transcription language: {self.transcription_lang}")
+        print("[DIARIZATION] Translation language will be set per request")
         
         self.diarization_pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=hf_token
         )
         
-        # Configure diarization for better multi-speaker detection
         # Using correct parameter names for pyannote/speaker-diarization-3.1
         try:
             self.diarization_pipeline.instantiate({
@@ -43,11 +54,11 @@ class DiarizationPipeline:
             print(f"[DIARIZATION] Warning: Could not configure diarization parameters: {e}")
             print("[DIARIZATION] Using default diarization settings")
         
-        device = "cpu"  # Force CPU for memory efficiency on Render
-        
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+
         self.whisper_model = WhisperModel(
             "large-v3",
-            device=device,
+            device=device_str,
             compute_type="int8",  # Use int8 for maximum memory efficiency
             num_workers=1,  # Limit workers to save memory
             download_root=None,  # Use default cache
@@ -59,9 +70,20 @@ class DiarizationPipeline:
         self.speaker_model = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir="pretrained_models/spkrec-ecapa-voxceleb",
-            run_opts={"device": device}
+            run_opts={"device": device_str}
         )
         print("[DIARIZATION] Speaker embedding model loaded (192-dim ECAPA-TDNN)")
+        
+        # Initialize translation module (always available for dynamic use)
+        self.translator = None
+        try:
+            print("[DIARIZATION] Initializing translation module...")
+            self.translator = TranslationModule(device=device_str)
+            print("[DIARIZATION] Translation module initialized and ready")
+        except Exception as e:
+            print(f"[DIARIZATION] Warning: Could not initialize translation module: {e}")
+            print("[DIARIZATION] Translation will be disabled")
+            self.translator = None
         
         # Minimal cache for memory efficiency
         self.audio_cache = {}
@@ -72,7 +94,7 @@ class DiarizationPipeline:
         self._cleanup_memory()
         
         print("[DIARIZATION] Optimized Diarization Pipeline initialized successfully")
-        print(f"[DIARIZATION] Using device: {device}")
+        print(f"[DIARIZATION] Using device: {device_str}")
         
     def _cleanup_memory(self):
         """Clean up memory to prevent OOM."""
@@ -80,6 +102,116 @@ class DiarizationPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    def extract_multiple_embeddings(self, audio_array: np.ndarray, sample_rate: int = 16000, 
+                                   segment_duration: float = 1.5) -> List[np.ndarray]:
+        """
+        Extract multiple 192-dim embeddings from audio by segmenting it.
+        This creates a more robust voice profile by capturing variations.
+        
+        Args:
+            audio_array: Audio as numpy array (float32, mono, normalized to [-1, 1])
+            sample_rate: Sample rate in Hz (default: 16000)
+            segment_duration: Duration of each segment in seconds (default: 1.5s)
+            
+        Returns:
+            List of embeddings, each with shape (192,)
+            
+        Example:
+            embeddings = pipeline.extract_multiple_embeddings(audio_array, 16000)
+            # Returns: [emb1, emb2, emb3, ...] - multiple 192-dim embeddings
+        """
+        try:
+            duration_sec = len(audio_array) / sample_rate
+            print(f"[DIARIZATION] ========== MULTI-SAMPLE REGISTRATION ==========")
+            print(f"[DIARIZATION] Total audio: {duration_sec:.2f}s ({len(audio_array)} samples)")
+            print(f"[DIARIZATION] Segment duration: {segment_duration}s")
+            
+            # Ensure audio is mono
+            if len(audio_array.shape) > 1:
+                audio_array = audio_array.mean(axis=1)
+            audio_array = audio_array.astype(np.float32)
+            
+            # DO NOT normalize whole audio here - normalize each segment individually
+            # to match how conversation segments are processed!
+            
+            embeddings = []
+            segment_samples = int(segment_duration * sample_rate)
+            overlap_samples = int(0.5 * sample_rate)  # 0.5s overlap
+            
+            start_idx = 0
+            segment_num = 0
+            
+            while start_idx < len(audio_array):
+                end_idx = min(start_idx + segment_samples, len(audio_array))
+                segment_audio = audio_array[start_idx:end_idx].copy()  # Copy to avoid modifying original
+                
+                # Skip if segment too short
+                if len(segment_audio) < sample_rate * 0.8:  # Minimum 0.8 seconds
+                    print(f"[DIARIZATION] Segment {segment_num+1}: Too short, skipping")
+                    break
+                
+                # Check segment energy BEFORE normalization
+                rms_energy = np.sqrt(np.mean(segment_audio**2))
+                if rms_energy < 0.001:  # Very quiet
+                    print(f"[DIARIZATION] Segment {segment_num+1}: Too quiet (RMS: {rms_energy:.6f}), skipping")
+                    start_idx += segment_samples - overlap_samples
+                    segment_num += 1
+                    continue
+                
+                # IMPORTANT: Normalize EACH segment individually (same as conversation processing!)
+                if np.max(np.abs(segment_audio)) > 0:
+                    segment_audio = segment_audio / np.max(np.abs(segment_audio))
+                
+                # Extract embedding from this segment
+                segment_duration_actual = len(segment_audio) / sample_rate
+                print(f"[DIARIZATION] Segment {segment_num+1}: {segment_duration_actual:.2f}s, RMS: {rms_energy:.6f}")
+                
+                audio_tensor = torch.from_numpy(segment_audio).unsqueeze(0)
+                
+                with torch.no_grad():
+                    embedding = self.speaker_model.encode_batch(audio_tensor)
+                    embedding = embedding.squeeze().cpu().numpy()
+                
+                # Validate embedding
+                if embedding.shape[0] == 192:
+                    embeddings.append(embedding)
+                    emb_stats = f"mean={np.mean(embedding):.4f}, std={np.std(embedding):.4f}"
+                    print(f"[DIARIZATION] ✓ Segment {segment_num+1} embedding extracted ({emb_stats})")
+                else:
+                    print(f"[DIARIZATION] ✗ Segment {segment_num+1} invalid shape: {embedding.shape}")
+                
+                # Move to next segment with overlap
+                start_idx += segment_samples - overlap_samples
+                segment_num += 1
+            
+            if len(embeddings) == 0:
+                print(f"[DIARIZATION] ERROR: No valid embeddings extracted!")
+                return None
+            
+            print(f"[DIARIZATION] ========================================")
+            print(f"[DIARIZATION] ✓ Extracted {len(embeddings)} embeddings total")
+            print(f"[DIARIZATION] Each embedding shape: (192,)")
+            
+            # Calculate stats across embeddings
+            embeddings_array = np.array(embeddings)
+            print(f"[DIARIZATION] Embeddings array shape: {embeddings_array.shape}")
+            print(f"[DIARIZATION] Overall mean: {np.mean(embeddings_array):.4f}")
+            print(f"[DIARIZATION] Overall std: {np.std(embeddings_array):.4f}")
+            
+            # Show individual embedding stats for debugging
+            for i, emb in enumerate(embeddings):
+                print(f"[DIARIZATION]   Sample {i+1}: mean={np.mean(emb):.4f}, std={np.std(emb):.4f}, norm={np.linalg.norm(emb):.4f}")
+            
+            print(f"[DIARIZATION] ========================================")
+            
+            return embeddings
+            
+        except Exception as e:
+            print(f"[DIARIZATION] ERROR extracting multiple embeddings: {e}")
+            import traceback
+            print(f"[DIARIZATION] Traceback: {traceback.format_exc()}")
+            return None
     
     def extract_speaker_embedding(self, audio_array: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
         """
@@ -108,9 +240,14 @@ class DiarizationPipeline:
             # Convert to float32
             audio_array = audio_array.astype(np.float32)
             
+            # Check audio energy BEFORE normalization
+            rms_energy = np.sqrt(np.mean(audio_array**2))
+            print(f"[DIARIZATION] Audio RMS energy (before norm): {rms_energy:.6f}")
+            
             # Normalize to [-1, 1] range
             if np.max(np.abs(audio_array)) > 0:
                 audio_array = audio_array / np.max(np.abs(audio_array))
+                print(f"[DIARIZATION] Audio normalized to range: [{np.min(audio_array):.4f}, {np.max(audio_array):.4f}]")
             
             # Convert to torch tensor [1, samples]
             audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)
@@ -122,7 +259,7 @@ class DiarizationPipeline:
             
             print(f"[DIARIZATION] ✓ Embedding extracted successfully!")
             print(f"[DIARIZATION] Embedding shape: {embedding.shape}")
-            print(f"[DIARIZATION] Embedding stats: mean={np.mean(embedding):.4f}, std={np.std(embedding):.4f}")
+            print(f"[DIARIZATION] Embedding stats: mean={np.mean(embedding):.4f}, std={np.std(embedding):.4f}, norm={np.linalg.norm(embedding):.4f}")
             
             return embedding
             
@@ -155,30 +292,128 @@ class DiarizationPipeline:
         
         return audio_segment
 
-    def transcribe_segment(self, audio_segment: np.ndarray, sample_rate: int = 16000) -> str:
-        """Transcribe a single audio segment using optimized Whisper settings."""
+    def transcribe_segment(self, audio_segment: np.ndarray, sample_rate: int = 16000, 
+                          transcription_lang: str = None, translation_lang: str = None) -> Dict[str, Any]:
+        """Transcribe a single audio segment using optimized Whisper settings.
+        
+        Args:
+            audio_segment: Audio data to transcribe
+            sample_rate: Sample rate of audio
+            transcription_lang: Language for transcription (uses default if None)
+            translation_lang: Target language for translation (no translation if None)
+        
+        Returns:
+            Dictionary containing:
+                - 'text': Final text (translated if needed)
+                - 'original_text': Original transcription
+                - 'translated': Boolean indicating if translation was performed
+                - 'source_lang': Source language
+                - 'target_lang': Target language (if translated)
+        """
         try:
+            # Use provided language or default
+            source_lang = transcription_lang if transcription_lang else self.transcription_lang
+            
             # Preprocess audio for maximum accuracy
             audio_segment = self.preprocess_audio(audio_segment, sample_rate)
-            # Use optimized Whisper settings for Cantonese transcription - accuracy priority
+            
+            # Use language-specific Whisper settings
             segments, info = self.whisper_model.transcribe(
                 audio_segment,
-                language="yue",  # Cantonese
+                language=source_lang,
                 task="transcribe",  # Explicitly set task
             )
             
             # Combine all segments into one text
-            text = " ".join([segment.text for segment in segments]).strip()
+            original_text = " ".join([segment.text for segment in segments]).strip()
             
-            # Post-process for Cantonese output
-            text = self.ensure_cantonese_output(text, info)
+            # Post-process for language output
+            original_text = self.ensure_cantonese_output(original_text, info)
             
-            return text
+            # Prepare result
+            result = {
+                'text': original_text,
+                'original_text': original_text,
+                'translated': False,
+                'source_lang': source_lang,
+                'target_lang': None
+            }
+            
+            # Apply translation if needed (and target language is provided)
+            if self.translator and translation_lang:
+                translation_result = self.translator.translate_text(
+                    original_text,
+                    source_lang,
+                    translation_lang
+                )
+                
+                if translation_result.get('translated'):
+                    result['text'] = translation_result['text']
+                    result['translated'] = True
+                    result['target_lang'] = translation_lang
+                    print(f"[DIARIZATION] Translated: '{original_text[:30]}...' -> '{result['text'][:30]}...'")
+                elif translation_result.get('error'):
+                    print(f"[DIARIZATION] Translation error: {translation_result['error']}")
+                    # Keep original text if translation fails
+            
+            return result
             
         except Exception as e:
             print(f"[DIARIZATION] Error transcribing segment: {e}")
-            return ""
+            return {
+                'text': '',
+                'original_text': '',
+                'translated': False,
+                'source_lang': source_lang if 'source_lang' in locals() else self.transcription_lang,
+                'target_lang': None
+            }
 
+    def compare_with_multiple_embeddings(self, segment_embedding: np.ndarray, 
+                                         registered_embeddings: List[np.ndarray]) -> Dict[str, Any]:
+        """
+        Compare a segment embedding with multiple registered embeddings.
+        Uses voting and averaging for robust detection.
+        
+        Args:
+            segment_embedding: Embedding from current segment (192,)
+            registered_embeddings: List of registered embeddings [(192,), (192,), ...]
+            
+        Returns:
+            Dictionary with similarity metrics:
+                - 'max_similarity': Best match score
+                - 'avg_similarity': Average across all samples
+                - 'median_similarity': Median score
+                - 'match_count': Number of samples above threshold
+        """
+        similarities = []
+        
+        for i, reg_emb in enumerate(registered_embeddings):
+            sim = self.compare_embeddings(segment_embedding, reg_emb)
+            similarities.append(sim)
+            # Debug: Show each comparison
+            print(f"[DIARIZATION]     Sample {i+1}: similarity = {sim:.4f}")
+        
+        similarities_array = np.array(similarities)
+        
+        # Calculate different metrics
+        max_sim = np.max(similarities_array)
+        avg_sim = np.mean(similarities_array)
+        median_sim = np.median(similarities_array)
+        
+        # Count how many samples are above threshold (0.65)
+        match_count = np.sum(similarities_array >= 0.65)
+        
+        print(f"[DIARIZATION]   Individual similarities: {[f'{s:.4f}' for s in similarities]}")
+        
+        return {
+            'max_similarity': float(max_sim),
+            'avg_similarity': float(avg_sim),
+            'median_similarity': float(median_sim),
+            'match_count': int(match_count),
+            'total_samples': len(similarities),
+            'all_similarities': similarities
+        }
+    
     def compare_embeddings(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
         """
         Compare two speaker embeddings using cosine similarity.
@@ -240,16 +475,23 @@ class DiarizationPipeline:
         # Return the text as-is for now, but log the issue
         return text
 
-    def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000, registered_voices: Dict[str, Any] = None) -> Dict[str, Any]:
+    def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000, 
+                           registered_voices: Dict[str, Any] = None,
+                           transcription_lang: str = None, 
+                           translation_lang: str = None) -> Dict[str, Any]:
         """Process audio array for speaker diarization and transcription.
         
         Args:
             audio_array: Audio data as numpy array
             sample_rate: Sample rate in Hz
             registered_voices: Dictionary of registered voice embeddings {voice_id: {'embedding': np.array, ...}}
+            transcription_lang: Language for transcription (uses default if None)
+            translation_lang: Target language for translation (no translation if None)
         """
         try:
             print(f"[DIARIZATION] Processing audio array: {len(audio_array)} samples, {sample_rate} Hz")
+            print(f"[DIARIZATION] Transcription language: {transcription_lang or self.transcription_lang}")
+            print(f"[DIARIZATION] Translation language: {translation_lang or 'None (no translation)'}")
             
             # Debug: Check what we received
             print(f"[DIARIZATION] DEBUG: registered_voices parameter = {type(registered_voices)}")
@@ -370,24 +612,40 @@ class DiarizationPipeline:
                         if segment_key in self.audio_cache:
                             cached_text = self.audio_cache[segment_key]
                     
+                    transcription_result = None
                     if cached_text is not None:
-                        text = cached_text
+                        # Cached text is just a string, convert to result dict
+                        transcription_result = {
+                            'text': cached_text,
+                            'original_text': cached_text,
+                            'translated': False,
+                            'source_lang': self.transcription_lang,
+                            'target_lang': None
+                        }
                         print(f"[DIARIZATION] Using cached transcription for segment {segment_count + 1}")
                     else:
-                        # Transcribe segment
+                        # Transcribe segment (returns dict with translation info)
                         print(f"[DIARIZATION] Transcribing segment: {start_time:.2f}s - {end_time:.2f}s")
-                        text = self.transcribe_segment(segment_audio, sample_rate)
+                        transcription_result = self.transcribe_segment(
+                            segment_audio, 
+                            sample_rate,
+                            transcription_lang=transcription_lang,
+                            translation_lang=translation_lang
+                        )
                         
-                        # Cache the result
+                        # Cache the text result
                         with self.cache_lock:
-                            self.audio_cache[segment_key] = text
+                            self.audio_cache[segment_key] = transcription_result.get('text', '')
                             # Limit cache size
                             if len(self.audio_cache) > 100:
                                 # Remove oldest entries
                                 oldest_key = next(iter(self.audio_cache))
                                 del self.audio_cache[oldest_key]
                     
-                    # OPTIMIZATION 5: Filter out empty or very short transcriptions
+                    # Extract text from result
+                    text = transcription_result.get('text', '') if transcription_result else ''
+                    
+                    #  Filter out empty or very short transcriptions
                     if not text or len(text.strip()) < 1:  # Very lenient - only skip completely empty
                         skipped_empty += 1
                         continue
@@ -429,18 +687,101 @@ class DiarizationPipeline:
                         if segment_embedding is not None:
                             # Get the wearer's registered voice (only one voice)
                             voice_id, voice_data = next(iter(registered_voices.items()))
-                            registered_embedding = voice_data.get('embedding')
                             
-                            if registered_embedding is not None:
-                                similarity = self.compare_embeddings(segment_embedding, registered_embedding)
-                                voice_similarity = similarity
-                                print(f"[DIARIZATION] Similarity with wearer's voice: {similarity:.3f}")
+                            # Check if using multi-sample registration
+                            registered_embeddings = voice_data.get('embeddings')  # List of embeddings
+                            registered_embedding_single = voice_data.get('embedding')  # Single embedding (legacy)
+                            
+                            if registered_embeddings is not None and len(registered_embeddings) > 1:
+                                # Multi-sample comparison
+                                print(f"[DIARIZATION] Comparing with {len(registered_embeddings)} registered samples")
                                 
-                                if similarity > 0.75:
+                                result = self.compare_with_multiple_embeddings(segment_embedding, registered_embeddings)
+                                
+                                max_sim = result['max_similarity']
+                                avg_sim = result['avg_similarity']
+                                median_sim = result['median_similarity']
+                                match_count = result['match_count']
+                                total_samples = result['total_samples']
+                                
+                                # Use median similarity for decision (more robust than average)
+                                similarity = median_sim
+                                voice_similarity = similarity
+                                
+                                # Get current segment embedding stats for comparison
+                                seg_emb_mean = np.mean(segment_embedding)
+                                seg_emb_std = np.std(segment_embedding)
+                                seg_emb_norm = np.linalg.norm(segment_embedding)
+                                
+                                print(f"[DIARIZATION] ========== VOICE COMPARISON DEBUG ==========")
+                                print(f"[DIARIZATION] Current segment embedding: mean={seg_emb_mean:.4f}, std={seg_emb_std:.4f}, norm={seg_emb_norm:.4f}")
+                                print(f"[DIARIZATION] Comparing with {total_samples} registered embeddings:")
+                                
+                                # Show first registered embedding stats for comparison
+                                reg_emb_0 = registered_embeddings[0]
+                                reg_mean = np.mean(reg_emb_0)
+                                reg_std = np.std(reg_emb_0)
+                                reg_norm = np.linalg.norm(reg_emb_0)
+                                print(f"[DIARIZATION] Registered sample 1: mean={reg_mean:.4f}, std={reg_std:.4f}, norm={reg_norm:.4f}")
+                                
+                                print(f"[DIARIZATION] Multi-sample results:")
+                                print(f"[DIARIZATION]   Max: {max_sim:.4f}, Avg: {avg_sim:.4f}, Median: {median_sim:.4f}")
+                                print(f"[DIARIZATION]   Matches: {match_count}/{total_samples} samples above 0.65")
+                                print(f"[DIARIZATION] ===========================================")
+                                
+                                # Decision logic: Adjusted for real-world similarity ranges
+                                # Based on logs: same speaker typically gets 0.50-0.70 similarity
+                                # Different speaker typically gets 0.20-0.45 similarity
+                                
+                                match_ratio = match_count / total_samples
+                                
+                                # Get similarities array from result
+                                all_sims = np.array(result['all_similarities'])
+                                
+                                # Multiple criteria for detection (prevents false positives)
+                                
+                                # Criterion 1: High average (most reliable)
+                                if avg_sim >= 0.55:
                                     is_wearer = True
-                                    print(f"[DIARIZATION] ✓ Segment identified as WEARER (similarity: {similarity:.3f})")
+                                    confidence_pct = avg_sim * 100
+                                    print(f"[DIARIZATION] WEARER (AVG MATCH) - Avg: {confidence_pct:.1f}%, Median: {median_sim:.4f}")
+                                
+                                # Criterion 2: Good median + at least one strong match
+                                elif median_sim >= 0.52 and max_sim >= 0.60:
+                                    is_wearer = True
+                                    print(f"[DIARIZATION] WEARER (MEDIAN+MAX) - Median: {median_sim:.4f}, Max: {max_sim:.4f}")
+                                
+                                # Criterion 3: At least 2 samples match well (40% of samples)
+                                elif match_ratio >= 0.4 and max_sim >= 0.65:
+                                    is_wearer = True
+                                    print(f"[DIARIZATION] WEARER (VOTE MATCH) - {match_count}/{total_samples} samples, Max: {max_sim:.4f}")
+                                
+                                # Criterion 4: At least half of samples are somewhat similar (>= 0.50)
+                                elif np.sum(all_sims >= 0.50) >= (total_samples / 2):
+                                    is_wearer = True
+                                    matches_50 = int(np.sum(all_sims >= 0.50))
+                                    print(f"[DIARIZATION] WEARER (MAJORITY) - {matches_50}/{total_samples} above 0.50, Avg: {avg_sim:.4f}")
+                                
                                 else:
-                                    print(f"[DIARIZATION] → Segment is OTHER speaker (similarity: {similarity:.3f})")
+                                    is_wearer = False
+                                    print(f"[DIARIZATION] OTHER SPEAKER - Avg: {avg_sim:.4f}, Median: {median_sim:.4f}, Max: {max_sim:.4f}")
+                                
+                            elif registered_embedding_single is not None:
+                                # Single-sample comparison (legacy/fallback)
+                                print(f"[DIARIZATION] Using single-sample comparison")
+                                similarity = self.compare_embeddings(segment_embedding, registered_embedding_single)
+                                voice_similarity = similarity
+                                
+                                SIMILARITY_THRESHOLD = 0.70  # Stricter for single sample
+                                
+                                print(f"[DIARIZATION] Similarity: {similarity:.4f} (threshold: {SIMILARITY_THRESHOLD})")
+                                
+                                if similarity >= SIMILARITY_THRESHOLD:
+                                    is_wearer = True
+                                    confidence_pct = similarity * 100
+                                    print(f"[DIARIZATION] ✓ WEARER - Confidence: {confidence_pct:.1f}%")
+                                else:
+                                    print(f"[DIARIZATION] → OTHER SPEAKER - {similarity:.4f} < {SIMILARITY_THRESHOLD}")
                     
                     # Add segment with voice matching info
                     segment_data = {
@@ -451,6 +792,14 @@ class DiarizationPipeline:
                         'duration': duration,
                         'confidence': 0.9  # Default confidence for optimized processing
                     }
+                    
+                    # Add translation info if available
+                    if transcription_result:
+                        segment_data['original_text'] = transcription_result.get('original_text', text)
+                        segment_data['translated'] = transcription_result.get('translated', False)
+                        segment_data['source_lang'] = transcription_result.get('source_lang', transcription_lang or self.transcription_lang)
+                        if transcription_result.get('target_lang'):
+                            segment_data['target_lang'] = transcription_result.get('target_lang')
                     
                     # Add voice matching results if wearer's voice is registered
                     if has_registered_voice:
@@ -503,19 +852,3 @@ class DiarizationPipeline:
             }
 
 
-if __name__ == "__main__":
-    # Test the optimized pipeline
-    hf_token = os.getenv("HF_TOKEN", "hf_your_token_here")
-    pipeline = DiarizationPipeline(hf_token)
-    
-    # Test with a sample audio file
-    test_file = "recorded_audio/20250316_223721.wav"
-    if os.path.exists(test_file):
-        audio_array, sample_rate = sf.read(test_file)
-        result = pipeline.process_audio_array(audio_array, sample_rate)
-        if result:
-            print(f"Found {len(result['segments'])} segments")
-            for segment in result['segments']:
-                print(f"  {segment['speaker_id']}: {segment['transcription']}")
-    else:
-        print("No test audio file found")
