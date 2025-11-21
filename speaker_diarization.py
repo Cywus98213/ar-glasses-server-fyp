@@ -45,11 +45,11 @@ class DiarizationPipeline:
         try:
             self.diarization_pipeline.instantiate({
                 "clustering": {
-                    "threshold": 0.5,  # Higher threshold to reduce false speakers (was 0.3)
-                    "min_cluster_size": 2,  # Require at least 2 segments per speaker (was 1)
+                    "threshold": 0.5,  
+                    "min_cluster_size": 2,  
                 },
                 "segmentation": {
-                    "min_duration_off": 0.5,  # Minimum silence between speakers
+                    "min_duration_off": 0.5,  
                 }
             })
             print("[DIARIZATION] Diarization configured to reduce false speakers")
@@ -481,7 +481,8 @@ class DiarizationPipeline:
     def process_audio_array(self, audio_array: np.ndarray, sample_rate: int = 16000, 
                            registered_voices: Dict[str, Any] = None,
                            transcription_lang: str = None, 
-                           translation_lang: str = None) -> Dict[str, Any]:
+                           translation_lang: str = None,
+                           is_chunk: bool = False) -> Dict[str, Any]:
         """Process audio array for speaker diarization and transcription.
         
         Args:
@@ -490,25 +491,30 @@ class DiarizationPipeline:
             registered_voices: Dictionary of registered voice embeddings {voice_id: {'embedding': np.array, ...}}
             transcription_lang: Language for transcription (uses default if None)
             translation_lang: Target language for translation (no translation if None)
+            is_chunk: If True, this is a real-time chunk (optimize for speed while keeping diarization)
         """
         try:
-            print(f"[DIARIZATION] Processing audio array: {len(audio_array)} samples, {sample_rate} Hz")
-            print(f"[DIARIZATION] Transcription language: {transcription_lang or self.transcription_lang}")
-            print(f"[DIARIZATION] Translation language: {translation_lang or 'None (no translation)'}")
-            
-            # Debug: Check what we received
-            print(f"[DIARIZATION] DEBUG: registered_voices parameter = {type(registered_voices)}")
-            print(f"[DIARIZATION] DEBUG: registered_voices is None? {registered_voices is None}")
-            if registered_voices:
-                print(f"[DIARIZATION] DEBUG: registered_voices keys = {list(registered_voices.keys())}")
-                print(f"[DIARIZATION] DEBUG: Number of voices = {len(registered_voices)}")
+            # Only log for full audio, not chunks (will log after if segments found)
+            if not is_chunk:
+                chunk_mode = "FULL"
+                print(f"[DIARIZATION] Processing audio array ({chunk_mode}): {len(audio_array)} samples, {sample_rate} Hz")
+                print(f"[DIARIZATION] Transcription language: {transcription_lang or self.transcription_lang}")
+                print(f"[DIARIZATION] Translation language: {translation_lang or 'None (no translation)'}")
+                
+                # Debug: Check what we received
+                print(f"[DIARIZATION] DEBUG: registered_voices parameter = {type(registered_voices)}")
+                print(f"[DIARIZATION] DEBUG: registered_voices is None? {registered_voices is None}")
+                if registered_voices:
+                    print(f"[DIARIZATION] DEBUG: registered_voices keys = {list(registered_voices.keys())}")
+                    print(f"[DIARIZATION] DEBUG: Number of voices = {len(registered_voices)}")
             
             # Check if we have a registered voice (wearer's voice)
             has_registered_voice = registered_voices and len(registered_voices) > 0
-            if has_registered_voice:
-                print(f"[DIARIZATION] ✓ Registered voice detected - will identify wearer's segments")
-            else:
-                print(f"[DIARIZATION] ✗ No registered voice - processing normally")
+            if not is_chunk:
+                if has_registered_voice:
+                    print(f"[DIARIZATION] ✓ Registered voice detected - will identify wearer's segments")
+                else:
+                    print(f"[DIARIZATION] ✗ No registered voice - processing normally")
             
             # Ensure audio is mono and float32
             if len(audio_array.shape) > 1:
@@ -520,16 +526,17 @@ class DiarizationPipeline:
             if np.max(np.abs(audio_array)) > 0:
                 audio_array = audio_array / np.max(np.abs(audio_array))
             
-            
-            print(f"[DIARIZATION] Audio preprocessed: {len(audio_array)} samples, max={np.max(audio_array):.3f}")
+            if not is_chunk:
+                print(f"[DIARIZATION] Audio preprocessed: {len(audio_array)} samples, max={np.max(audio_array):.3f}")
             
             # Create temporary file for diarization (required by pyannote)
             temp_file = f"temp_audio_{int(time.time() * 1000)}.wav"
             sf.write(temp_file, audio_array, sample_rate)
             
             try:
-                # Perform speaker diarization
-                print("[DIARIZATION] Running speaker diarization...")
+                # Perform speaker diarization (silent for chunks)
+                if not is_chunk:
+                    print("[DIARIZATION] Running speaker diarization...")
                 diarization = self.diarization_pipeline(temp_file)
                 
                 # Debug: Print all detected speakers and their segments
@@ -543,25 +550,31 @@ class DiarizationPipeline:
                         'end': turn.end,
                         'duration': turn.end - turn.start
                     })
-                print(f"[DIARIZATION] Detected speakers: {sorted(unique_speakers)}")
-                print(f"[DIARIZATION] Total diarization segments: {len(all_segments)}")
-                print(f"[DIARIZATION] All diarization segments:")
-                for i, seg in enumerate(all_segments):
-                    print(f"  Segment {i+1}: {seg['speaker']} ({seg['start']:.2f}s - {seg['end']:.2f}s, {seg['duration']:.2f}s)")
                 
-                # Calculate total coverage
-                total_audio_duration = len(audio_array) / sample_rate
-                covered_duration = sum(seg['duration'] for seg in all_segments)
-                coverage_percent = (covered_duration / total_audio_duration) * 100
-                print(f"[DIARIZATION] Audio coverage: {covered_duration:.2f}s / {total_audio_duration:.2f}s ({coverage_percent:.1f}%)")
+                # Only log diarization details for full audio or when segments found
+                if not is_chunk or len(all_segments) > 0:
+                    print(f"[DIARIZATION] Detected speakers: {sorted(unique_speakers)}")
+                    print(f"[DIARIZATION] Total diarization segments: {len(all_segments)}")
+                    if len(all_segments) > 0:
+                        print(f"[DIARIZATION] All diarization segments:")
+                        for i, seg in enumerate(all_segments):
+                            print(f"  Segment {i+1}: {seg['speaker']} ({seg['start']:.2f}s - {seg['end']:.2f}s, {seg['duration']:.2f}s)")
+                    
+                    # Calculate total coverage
+                    total_audio_duration = len(audio_array) / sample_rate
+                    covered_duration = sum(seg['duration'] for seg in all_segments)
+                    coverage_percent = (covered_duration / total_audio_duration) * 100
+                    print(f"[DIARIZATION] Audio coverage: {covered_duration:.2f}s / {total_audio_duration:.2f}s ({coverage_percent:.1f}%)")
                 
-                # If no speakers detected, this might be the issue
+                # If no speakers detected, log warning only for full audio (not chunks)
                 if len(all_segments) == 0:
-                    print("[DIARIZATION] WARNING: No speakers detected by diarization!")
-                    print("[DIARIZATION] This could be due to:")
-                    print("[DIARIZATION] - Audio too short or too quiet")
-                    print("[DIARIZATION] - Diarization model issues")
-                    print("[DIARIZATION] - Audio format problems")
+                    if not is_chunk:
+                        print("[DIARIZATION] WARNING: No speakers detected by diarization!")
+                        print("[DIARIZATION] This could be due to:")
+                        print("[DIARIZATION] - Audio too short or too quiet")
+                        print("[DIARIZATION] - Diarization model issues")
+                        print("[DIARIZATION] - Audio format problems")
+                    # For chunks, completely silent - no logging at all
                 
                 # Process each speaker segment with optimizations
                 segments = []
@@ -829,18 +842,24 @@ class DiarizationPipeline:
                     else:
                         print(f"[DIARIZATION] Added segment {segment_count}: {speaker} [OTHER] - '{text[:50]}{'...' if len(text) > 50 else ''}'")
                 
-                print(f"[DIARIZATION] Processing complete: {len(segments)} valid segments found")
-                print(f"[DIARIZATION] Filtering summary:")
-                print(f"  - Skipped short segments: {skipped_short}")
-                print(f"  - Skipped low energy: {skipped_energy}")
-                print(f"  - Skipped empty transcriptions: {skipped_empty}")
-                print(f"  - Final valid segments: {len(segments)}")
+                # Only print detailed summary for full audio or when segments found
+                if not is_chunk or len(segments) > 0:
+                    print(f"[DIARIZATION] Processing complete: {len(segments)} valid segments found")
+                    if len(segments) > 0:
+                        print(f"[DIARIZATION] Filtering summary:")
+                        print(f"  - Skipped short segments: {skipped_short}")
+                        print(f"  - Skipped low energy: {skipped_energy}")
+                        print(f"  - Skipped empty transcriptions: {skipped_empty}")
+                        print(f"  - Final valid segments: {len(segments)}")
+                # For empty chunks, completely silent - no logging at all
                 
+                processing_method = 'chunk_diarization' if is_chunk else 'optimized_diarization'
                 return {
                     'segments': segments,
                     'total_duration': len(audio_array) / sample_rate,
                     'speaker_count': len(set(seg['speaker_id'] for seg in segments)),
-                    'processing_method': 'optimized_diarization'
+                    'processing_method': processing_method,
+                    'is_chunk': is_chunk
                 }
                 
             finally:

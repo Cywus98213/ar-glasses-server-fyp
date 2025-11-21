@@ -106,11 +106,22 @@ class ARGlassesServer:
 
 
     def _clear_debug_output(self):
-        """Clear debug output directory."""
+        """Clear debug output directory (both JSON and WAV files)."""
         try:
+            # Clear JSON files
+            json_count = 0
             for file in self.debug_json_dir.glob("*.json"):
                 file.unlink()
-            print("[SERVER] Cleared debug output directory")
+                json_count += 1
+            
+            # Clear WAV files
+            wav_count = 0
+            for file in self.debug_json_dir.glob("*.wav"):
+                file.unlink()
+                wav_count += 1
+            
+            if json_count > 0 or wav_count > 0:
+                print(f"[SERVER] Cleared debug output directory ({json_count} JSON, {wav_count} WAV files)")
         except Exception as e:
             print(f"[SERVER] Warning: Could not clear debug output: {e}")
 
@@ -128,8 +139,11 @@ class ARGlassesServer:
             print("[SERVER] Warning: config.env not found, using OS environment only")
 
     def _save_json_output(self, message_type: str, message: Dict[str, Any]):
-        """Save JSON output to file for debugging."""
+        """Save JSON output to file for debugging. Clears old files to prevent accumulation."""
         try:
+            # Clear old debug files before saving new one (keep only recent)
+            self._clear_old_debug_files()
+            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             filename = f"{message_type}_{timestamp}.json"
             filepath = self.debug_json_dir / filename
@@ -137,10 +151,47 @@ class ARGlassesServer:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(message, f, indent=2, ensure_ascii=False)
             
-            print(f"[DEBUG] Saved output to {filename}")
+            # Only log for important messages to reduce spam
+            if message_type in ["processing_result", "segment_result"]:
+                print(f"[DEBUG] Saved output to {filename}")
             
         except Exception as e:
             print(f"[DEBUG] Error saving debug output: {e}")
+    
+    def _clear_old_debug_files(self, keep_recent: int = 10):
+        """Clear old debug files (JSON and WAV), keeping only the most recent ones."""
+        try:
+            # Get all JSON files sorted by modification time (newest first)
+            json_files = sorted(
+                self.debug_json_dir.glob("*.json"),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True
+            )
+            
+            # Get all WAV files sorted by modification time (newest first)
+            wav_files = sorted(
+                self.debug_json_dir.glob("*.wav"),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True
+            )
+            
+            # Keep only the most recent JSON files, delete the rest
+            if len(json_files) > keep_recent:
+                files_to_delete = json_files[keep_recent:]
+                for file in files_to_delete:
+                    file.unlink()
+                if len(files_to_delete) > 0:
+                    print(f"[DEBUG] Cleared {len(files_to_delete)} old JSON files (kept {keep_recent} most recent)")
+            
+            # Keep only the most recent WAV files, delete the rest
+            if len(wav_files) > keep_recent:
+                files_to_delete = wav_files[keep_recent:]
+                for file in files_to_delete:
+                    file.unlink()
+                if len(files_to_delete) > 0:
+                    print(f"[DEBUG] Cleared {len(files_to_delete)} old WAV files (kept {keep_recent} most recent)")
+        except Exception as e:
+            print(f"[DEBUG] Warning: Could not clear old debug files: {e}")
 
     async def _safe_send_message(self, websocket, message: Dict[str, Any]):
         """Safely send message to WebSocket."""
@@ -159,27 +210,42 @@ class ARGlassesServer:
             print(f"[SERVER] Error sending message: {e}")
             return False
 
-    def process_audio(self, audio_array: np.ndarray, sample_rate: int, translation_language: str) -> dict:
-        """Process audio using diarization only (faster processing)."""
+    def process_audio(self, audio_array: np.ndarray, sample_rate: int, translation_language: str, is_chunk: bool = False) -> dict:
+        """Process audio using diarization (supports both full audio and real-time chunks).
+        
+        Args:
+            audio_array: Audio data as numpy array
+            sample_rate: Sample rate in Hz
+            translation_language: Target language for translation
+            is_chunk: If True, this is a real-time chunk (optimized for speed while keeping diarization)
+        """
         try:
-            print(f"[SERVER] PROCESSING AUDIO: {len(audio_array)} samples at {sample_rate}Hz")
-            print(f"[SERVER] Using diarization pipeline for faster processing")
+            # Only log for full audio, not chunks (will log after if segments found)
+            if not is_chunk:
+                mode = "FULL AUDIO"
+                print(f"[SERVER] PROCESSING AUDIO ({mode}): {len(audio_array)} samples at {sample_rate}Hz")
+                print(f"[SERVER] Using diarization pipeline with speaker identification")
             
             # Clean up memory before processing
             self._cleanup_memory()
             
             # Use only diarization pipeline (includes speaker detection and transcription)
-            print("[SERVER] Running diarization pipeline...")
-            print(f"[SERVER] DEBUG: self.registered_voices = {list(self.registered_voices.keys()) if self.registered_voices else 'None'}")
+            if not is_chunk:
+                print("[SERVER] Running diarization pipeline...")
+                print(f"[SERVER] DEBUG: self.registered_voices = {list(self.registered_voices.keys()) if self.registered_voices else 'None'}")
 
             # check if the wearer's voice is registered
-            if self.registered_voices:
-                print(f"[SERVER] Wearer's voice registered - will identify wearer vs others")
-                for voice_id, voice_data in self.registered_voices.items():
-                    print(f"[SERVER] DEBUG: Voice ID: {voice_id}")
-                    print(f"[SERVER] DEBUG: Embedding shape: {voice_data['embedding'].shape if voice_data.get('embedding') is not None else 'None'}")
-            else:
-                print(f"[SERVER] No registered voice - processing all speakers normally")
+            if not is_chunk:
+                if self.registered_voices:
+                    print(f"[SERVER] Wearer's voice registered - will identify wearer vs others")
+                    for voice_id, voice_data in self.registered_voices.items():
+                        print(f"[SERVER] DEBUG: Voice ID: {voice_id}")
+                        if 'embeddings' in voice_data:
+                            print(f"[SERVER] DEBUG: Multi-sample embeddings: {len(voice_data['embeddings'])} samples")
+                        elif 'embedding' in voice_data:
+                            print(f"[SERVER] DEBUG: Single embedding shape: {voice_data['embedding'].shape if voice_data.get('embedding') is not None else 'None'}")
+                else:
+                    print(f"[SERVER] No registered voice - processing all speakers normally")
 
             # pack the audio result with dynamic language settings
             diarization_result = self.diarization_pipeline.process_audio_array(
@@ -187,10 +253,15 @@ class ARGlassesServer:
                 sample_rate,
                 registered_voices=self.registered_voices,
                 transcription_lang=self.transcription_language,
-                translation_lang=translation_language
+                translation_lang=translation_language,
+                is_chunk=is_chunk
             )
-            print(f"[SERVER] Diarization result: {diarization_result}")
-            print(f"[SERVER] Processing method: {diarization_result.get('processing_method', 'unknown') if diarization_result else 'None'}")
+            # Only log diarization result details if we have segments or it's full audio
+            if diarization_result and diarization_result.get('segments'):
+                print(f"[SERVER] Processing method: {diarization_result.get('processing_method', 'unknown')}")
+            elif not is_chunk:
+                print(f"[SERVER] Diarization result: {diarization_result}")
+                print(f"[SERVER] Processing method: {diarization_result.get('processing_method', 'unknown') if diarization_result else 'None'}")
             
             if not diarization_result or 'segments' not in diarization_result:
                 print("[SERVER] Diarization failed!")
@@ -202,10 +273,15 @@ class ARGlassesServer:
                 }
             
             segments = diarization_result.get('segments', [])
-            print(f"[SERVER] Diarization found {len(segments)} segments")
+            
+            # Only log if we have segments or it's full audio (not chunks)
+            if segments or not is_chunk:
+                print(f"[SERVER] Diarization found {len(segments)} segments")
             
             if not segments:
-                print("[SERVER] No segments found by diarization!")
+                # For chunks, return silently. For full audio, log the issue.
+                if not is_chunk:
+                    print("[SERVER] No segments found by diarization!")
                 return {
                     'segments': [],
                     'total_duration': len(audio_array) / sample_rate,
@@ -323,13 +399,16 @@ class ARGlassesServer:
                         audio_data = data.get("audio_data", "")
                         sample_rate = data.get("sample_rate", 16000)
                         translation_language = data.get("translation_language", None)
+                        is_chunk = data.get("is_chunk", False)  # Detect if this is a real-time chunk
                         
-                        print(f"\n{'='*60}")
-                        print(f"[SERVER] AUDIO PROCESSING STARTED")
-                        print(f"[SERVER] Chunk ID: {chunk_id}")
-                        print(f"[SERVER] Sample Rate: {sample_rate} Hz")
-                        print(f"[SERVER] Audio Data Length: {len(audio_data)} characters")
-                        print(f"{'='*60}")
+                        # Only log initial info for full audio, not chunks (to reduce noise)
+                        if not is_chunk:
+                            print(f"\n{'='*60}")
+                            print(f"[SERVER] AUDIO PROCESSING STARTED (FULL)")
+                            print(f"[SERVER] Chunk ID: {chunk_id}")
+                            print(f"[SERVER] Sample Rate: {sample_rate} Hz")
+                            print(f"[SERVER] Audio Data Length: {len(audio_data)} characters")
+                            print(f"{'='*60}")
                         
                         # Send audio received confirmation
                         received_response = {
@@ -339,24 +418,32 @@ class ARGlassesServer:
                             "timestamp": time.time()
                         }
                         await self._safe_send_message(websocket, received_response)
-                        print("[SERVER] Sent audio received confirmation")
+                        
+                        if not is_chunk:
+                            print("[SERVER] Sent audio received confirmation")
                         
                         # Decode audio
-                        print("[SERVER] Decoding base64 audio data...")
+                        if not is_chunk:
+                            print("[SERVER] Decoding base64 audio data...")
                         try:
                             audio_bytes = base64.b64decode(audio_data)
-                            print(f"[SERVER] Decoded audio bytes: {len(audio_bytes)} bytes")
+                            
+                            if not is_chunk:
+                                print(f"[SERVER] Decoded audio bytes: {len(audio_bytes)} bytes")
                             
                             audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                            print(f"[SERVER] Converted to float32 array: {len(audio_array)} samples")
-                            print(f"[SERVER] Audio array stats: min={np.min(audio_array):.4f}, max={np.max(audio_array):.4f}, mean={np.mean(audio_array):.4f}")
                             
-                            # Save debug audio file
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                            debug_filename = f"received_audio_{chunk_id}_{timestamp}.wav"
-                            debug_file_path = self.debug_json_dir / debug_filename
-                            sf.write(debug_file_path, audio_array, sample_rate)
-                            print(f"[SERVER] Saved debug audio: {debug_filename}")
+                            if not is_chunk:
+                                print(f"[SERVER] Converted to float32 array: {len(audio_array)} samples")
+                                print(f"[SERVER] Audio array stats: min={np.min(audio_array):.4f}, max={np.max(audio_array):.4f}, mean={np.mean(audio_array):.4f}")
+                            
+                            # Save debug audio file (only for full audio, not chunks to reduce storage)
+                            if not is_chunk:
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                                debug_filename = f"received_audio_{chunk_id}_{timestamp}.wav"
+                                debug_file_path = self.debug_json_dir / debug_filename
+                                sf.write(debug_file_path, audio_array, sample_rate)
+                                print(f"[SERVER] Saved debug audio: {debug_filename}")
                             
                         except Exception as e:
                             print(f"[SERVER] Error decoding audio: {e}")
@@ -364,31 +451,48 @@ class ARGlassesServer:
                             print(f"[SERVER] Traceback: {traceback.format_exc()}")
                             continue
                         
-                        # Process audio
-                        print("[SERVER] Starting audio processing...")
-                        print(f"[SERVER] Audio array shape: {audio_array.shape}")
-                        print(f"[SERVER] Audio array dtype: {audio_array.dtype}")
-                        print(f"[SERVER] Audio array range: [{np.min(audio_array):.4f}, {np.max(audio_array):.4f}]")
-                        print(f"[SERVER] Using transcription language: {self.transcription_language}")
-                        print(f"[SERVER] Using translation language: {translation_language or 'None'}")
+                        # Process audio (silent for chunks until we know if there are segments)
+                        if not is_chunk:
+                            print("[SERVER] Starting audio processing...")
+                            print(f"[SERVER] Audio array shape: {audio_array.shape}")
+                            print(f"[SERVER] Audio array dtype: {audio_array.dtype}")
+                            print(f"[SERVER] Audio array range: [{np.min(audio_array):.4f}, {np.max(audio_array):.4f}]")
+                            print(f"[SERVER] Using transcription language: {self.transcription_language}")
+                            print(f"[SERVER] Using translation language: {translation_language or 'None'}")
+                            print(f"[SERVER] Processing mode: FULL AUDIO")
                         
-                        result = self.process_audio(audio_array, sample_rate, translation_language)
+                        result = self.process_audio(audio_array, sample_rate, translation_language, is_chunk=is_chunk)
                         
-                        print(f"[SERVER] Processing result: {result}")
+                        segments = result.get('segments', [])
+                        num_segments = len(segments)
+                        
+                        # For chunks with 0 segments, skip completely silently (no logging at all)
+                        if is_chunk and num_segments == 0:
+                            continue
+                        
+                        # For full audio with 0 segments, still log but don't spam
+                        if not is_chunk and num_segments == 0:
+                            print(f"[SERVER] No segments found in full audio (duration: {result.get('total_duration', 0):.2f}s)")
+                            # Still send completion for full audio to notify client
+                            completion_data = {
+                                "type": "audio_processed",
+                                "chunk_id": chunk_id,
+                                "total_segments": 0,
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, completion_data)
+                            continue
+                        
+                        # Log results only if we have segments
                         print(f"[SERVER] Processing method: {result.get('processing_method', 'unknown')}")
-                        print(f"[SERVER] Number of segments: {len(result.get('segments', []))}")
+                        print(f"[SERVER] Number of segments: {num_segments}")
                         
                         # Log each segment individually
-                        for i, segment in enumerate(result.get('segments', [])):
-                            print(f"[SERVER] Segment {i+1}: {segment}")
+                        for i, segment in enumerate(segments):
+                            speaker_marker = "[WEARER]" if segment.get('is_wearer') else "[OTHER]"
+                            print(f"[SERVER] Segment {i+1}: {segment.get('speaker_id', 'UNKNOWN')} {speaker_marker} - '{segment.get('text', '')[:50]}'")
                         
-                        # Check if we're getting the expected processing method
-                        if result.get('processing_method') != 'diarization':
-                            print(f"[SERVER] WARNING: Unexpected processing method: {result.get('processing_method')}")
-                            print(f"[SERVER] Expected: diarization")
-                            print(f"[SERVER] This indicates the processing is not working correctly!")
-                        
-                        # Save debug output
+                        # Save debug output only if we have segments
                         debug_result = {
                             "chunk_id": chunk_id,
                             "processing_result": result,
@@ -397,32 +501,30 @@ class ARGlassesServer:
                         self._save_json_output("processing_result", debug_result)
                         
                         # Send results
-                        if result.get('segments'):
-                            for i, segment in enumerate(result['segments']):
-                                segment_data = {
-                                    "type": "segment_result",
-                                    "chunk_id": chunk_id,
-                                    "segment": segment,
-                                    "timestamp": time.time()
-                                }
-                                
-                                # Save debug output
-                                self._save_json_output("segment_result", segment_data)
-                                
-                                # Send to client
-                                await self._safe_send_message(websocket, segment_data)
-                                print(f"[SERVER] Sent segment {i+1}: {segment.get('text', '')[:50]}")
+                        for i, segment in enumerate(segments):
+                            segment_data = {
+                                "type": "segment_result",
+                                "chunk_id": chunk_id,
+                                "segment": segment,
+                                "timestamp": time.time()
+                            }
+                            
+                            # Save debug output
+                            self._save_json_output("segment_result", segment_data)
+                            
+                            # Send to client
+                            await self._safe_send_message(websocket, segment_data)
                         
                         # Send completion message
                         completion_data = {
                             "type": "audio_processed",
                             "chunk_id": chunk_id,
-                            "total_segments": len(result.get('segments', [])),
+                            "total_segments": num_segments,
                             "timestamp": time.time()
                         }
                         self._save_json_output("completion", completion_data)
                         await self._safe_send_message(websocket, completion_data)
-                        print(f"[SERVER] Audio processing completed for {chunk_id}")
+                        print(f"[SERVER] Audio processing completed for {chunk_id}: {num_segments} segments")
                         
                     
                     elif message_type == "register_voice":

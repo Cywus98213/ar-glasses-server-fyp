@@ -260,37 +260,3 @@ class TranslationModule:
             languages.add(target)
         return sorted(list(languages))
 
-
-if __name__ == "__main__":
-    # Test the translation module
-    print("Testing Translation Module...")
-    
-    translator = TranslationModule()
-    
-    # Test 1: Same language (should not translate)
-    print("\n" + "="*60)
-    print("Test 1: Same language (yue -> zh)")
-    result = translator.translate_text("你好世界", "yue", "zh")
-    print(f"Result: {result}")
-    
-    # Test 2: Different language (should translate)
-    print("\n" + "="*60)
-    print("Test 2: Different language (zh -> en)")
-    result = translator.translate_text("你好世界", "zh", "en")
-    print(f"Result: {result}")
-    
-    # Test 3: English to Chinese
-    print("\n" + "="*60)
-    print("Test 3: Different language (en -> zh)")
-    result = translator.translate_text("Hello world", "en", "zh")
-    print(f"Result: {result}")
-    
-    # Test 4: Unsupported pair
-    print("\n" + "="*60)
-    print("Test 4: Unsupported pair (zh -> fr)")
-    result = translator.translate_text("你好世界", "zh", "fr")
-    print(f"Result: {result}")
-    
-    print("\n" + "="*60)
-    print(f"Supported languages: {translator.get_supported_languages()}")
-
