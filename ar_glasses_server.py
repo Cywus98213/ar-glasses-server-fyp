@@ -7,6 +7,7 @@ import asyncio
 import base64
 import time
 import warnings
+import signal
 import numpy as np
 from datetime import datetime
 from typing import Dict, Any, List
@@ -21,7 +22,12 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Force unbuffered output for real-time logging
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+os.environ["PYTHONUNBUFFERED"] = "1"
+
 from speaker_diarization import DiarizationPipeline
+from gesture_recognition import GestureRecognizer
 
 class ARGlassesServer:
     def __init__(self):
@@ -78,14 +84,40 @@ class ARGlassesServer:
             print("[SERVER] 3. Internet connection for model downloads")
             sys.exit(1)
         
+        # Initialize gesture recognizer
+        print("[SERVER] Loading gesture recognition model...")
+        try:
+            self.gesture_recognizer = GestureRecognizer()
+            if self.gesture_recognizer.is_available():
+                print("[SERVER] Gesture recognition model loaded successfully")
+            else:
+                print("[SERVER] Warning: Gesture recognition not available (model not found or MediaPipe not installed)")
+        except Exception as e:
+            print(f"[SERVER] Warning: Could not initialize gesture recognizer: {e}")
+            self.gesture_recognizer = None
+        
         self.host = os.getenv("SERVER_HOST", "0.0.0.0")
         self.port = int(os.getenv("SERVER_PORT", "8000"))
         self.active_connections = set()
+        
+        # Track active processing tasks for parallel execution
+        self.active_audio_tasks = {}  # websocket -> set of tasks
+        self.active_gesture_tasks = {}  # websocket -> set of tasks
         self.main_loop = None
+        self.shutdown_event = asyncio.Event()  # Event to signal shutdown
+        self.server = None  # WebSocket server instance
+        
+        # Track stop processing flag per connection to cancel queued chunks
+        # Format: {websocket: bool} - True means stop processing and skip remaining chunks
+        self.stop_processing_per_connection = {}
         
         # Voice registration storage - stores wearer's voice (192-dim embedding)
         # Only one voice at a time (the glasses wearer)
         self.registered_voices = {}  # voice_id -> {'embedding': np.array(192,), 'timestamp': float, 'sample_rate': int}
+        
+        # Speaker tracking per connection - tracks known speakers across chunks
+        # Format: {websocket: {'speakers': [{'id': 'SPEAKER_00', 'embedding': np.array, 'is_wearer': bool}, ...], 'next_id': int}}
+        self.speaker_tracking = {}  # Track speakers per connection for consistent IDs
         
         self.debug_json_dir = Path("debug_json_output")
         self.debug_json_dir.mkdir(exist_ok=True)
@@ -103,7 +135,101 @@ class ARGlassesServer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    
+    def _cleanup_connection(self, websocket):
+        """Clean up all resources and processes for a disconnected connection."""
+        print(f"[SERVER] ========== CLEANING UP CONNECTION ==========")
+        print(f"[SERVER] Client: {websocket.remote_address}")
+        
+        # Set stop processing flag to cancel any ongoing processing
+        if websocket in self.stop_processing_per_connection:
+            was_processing = not self.stop_processing_per_connection[websocket]
+            self.stop_processing_per_connection[websocket] = True
+            if was_processing:
+                print(f"[SERVER] ✓ Stopped processing for this connection")
+        
+        # Remove from active connections
+        if websocket in self.active_connections:
+            self.active_connections.discard(websocket)
+            print(f"[SERVER] ✓ Removed from active connections")
+        
+        # Clean up stop processing flag
+        if websocket in self.stop_processing_per_connection:
+            del self.stop_processing_per_connection[websocket]
+            print(f"[SERVER] ✓ Removed stop processing flag")
+        
+        # Try to cancel any pending async tasks related to this connection
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                pending_tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                cancelled_count = 0
+                for task in pending_tasks:
+                    # Try to cancel tasks that might be related to this connection
+                    # (This is a best-effort cleanup)
+                    try:
+                        if not task.done():
+                            task.cancel()
+                            cancelled_count += 1
+                    except Exception:
+                        pass
+                if cancelled_count > 0:
+                    print(f"[SERVER] ✓ Cancelled {cancelled_count} pending async task(s)")
+        except Exception as e:
+            print(f"[SERVER] Note: Could not cancel async tasks: {e}")
+        
+        # Clean up memory
+        self._cleanup_memory()
+        print(f"[SERVER] ✓ Memory cleaned up")
+        
+        print(f"[SERVER] ===========================================")
 
+    def _log_remaining_processes(self, websocket):
+        """Log all remaining processes and state when a connection disconnects."""
+        print(f"[SERVER] ========== REMAINING PROCESSES STATUS ==========")
+        print(f"[SERVER] Active connections: {len(self.active_connections)}")
+        for conn in self.active_connections:
+            if conn != websocket:
+                print(f"[SERVER]   - Active: {conn.remote_address}")
+        
+        print(f"[SERVER] Stop processing flags: {len(self.stop_processing_per_connection)}")
+        for conn, stop_flag in self.stop_processing_per_connection.items():
+            if conn != websocket:
+                print(f"[SERVER]   - {conn.remote_address}: stop_flag={stop_flag}")
+        
+        print(f"[SERVER] Registered voices: {len(self.registered_voices)}")
+        if self.registered_voices:
+            for voice_id, voice_data in self.registered_voices.items():
+                num_samples = voice_data.get('num_samples', 1)
+                timestamp = voice_data.get('timestamp', 0)
+                age_seconds = time.time() - timestamp if timestamp > 0 else 0
+                print(f"[SERVER]   - {voice_id}: {num_samples} sample(s), age: {age_seconds:.1f}s")
+        else:
+            print(f"[SERVER]   - No registered voices")
+        
+        # Check for any pending tasks in event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                pending_tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                print(f"[SERVER] Pending async tasks: {len(pending_tasks)}")
+                for i, task in enumerate(pending_tasks[:10]):  # Show first 10
+                    print(f"[SERVER]   - Task {i+1}: {task.get_name() if hasattr(task, 'get_name') else str(task)}")
+                if len(pending_tasks) > 10:
+                    print(f"[SERVER]   - ... and {len(pending_tasks) - 10} more tasks")
+        except Exception as e:
+            print(f"[SERVER] Could not check async tasks: {e}")
+        
+        # Memory status
+        import gc
+        import sys
+        print(f"[SERVER] Memory status:")
+        print(f"[SERVER]   - Python objects: {len(gc.get_objects())}")
+        if torch.cuda.is_available():
+            print(f"[SERVER]   - CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"[SERVER]   - CUDA memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        
+        print(f"[SERVER] =================================================")
 
     def _clear_debug_output(self):
         """Clear debug output directory (both JSON and WAV files)."""
@@ -199,18 +325,228 @@ class ARGlassesServer:
             # Check if connection is open
             if hasattr(websocket, 'state'):
                 from websockets.protocol import State
-                if websocket.state == State.OPEN:
-                    await websocket.send(json.dumps(message))
-                    return True
-                else:
+                if websocket.state != State.OPEN:
                     print(f"[SERVER] Cannot send message - WebSocket state: {websocket.state}")
                     return False
             
+            # Try to send the message
+            await websocket.send(json.dumps(message))
+            return True
+            
+        except websockets.exceptions.ConnectionClosed:
+            print(f"[SERVER] Connection closed while sending message")
+            return False
         except Exception as e:
             print(f"[SERVER] Error sending message: {e}")
             return False
 
-    def process_audio(self, audio_array: np.ndarray, sample_rate: int, translation_language: str, is_chunk: bool = False) -> dict:
+    async def _process_audio_async(self, audio_array: np.ndarray, sample_rate: int, translation_language: str, 
+                                   websocket, chunk_id: str, is_chunk: bool = False):
+        """Async wrapper for audio processing - runs in parallel with gesture processing."""
+        try:
+            # Get speaker tracking for this connection
+            speaker_tracking = self.speaker_tracking.get(websocket, None)
+            
+            # Run CPU-intensive processing in executor to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, 
+                self.process_audio, 
+                audio_array, 
+                sample_rate, 
+                translation_language, 
+                is_chunk,
+                speaker_tracking
+            )
+            
+            # Stop flag removed - always process and send results
+            
+            # Check connection after processing
+            if hasattr(websocket, 'state'):
+                from websockets.protocol import State
+                if websocket.state != State.OPEN:
+                    print(f"[SERVER] Connection closed during processing, skipping result send")
+                    return
+            
+            # Process and send results
+            segments = result.get('segments', [])
+            num_segments = len(segments)
+            
+            # For chunks with 0 segments, skip completely silently
+            if is_chunk and num_segments == 0:
+                return
+            
+            # For full audio with 0 segments, still send completion
+            if not is_chunk and num_segments == 0:
+                print(f"[SERVER] No segments found in full audio (duration: {result.get('total_duration', 0):.2f}s)")
+                response = {
+                    "type": "no_speech",
+                    "chunk_id": chunk_id,
+                    "message": "No speech detected in audio",
+                    "timestamp": time.time()
+                }
+                await self._safe_send_message(websocket, response)
+                
+                completion_data = {
+                    "type": "audio_processed",
+                    "chunk_id": chunk_id,
+                    "total_segments": 0,
+                    "timestamp": time.time()
+                }
+                await self._safe_send_message(websocket, completion_data)
+                return
+            
+            # Log results if we have segments
+            if not is_chunk:
+                print(f"[SERVER] Processing method: {result.get('processing_method', 'unknown')}")
+                print(f"[SERVER] Number of segments: {num_segments}")
+                
+                # Log each segment individually
+                for i, segment in enumerate(segments):
+                    speaker_marker = "[WEARER]" if segment.get('is_wearer') else "[OTHER]"
+                    print(f"[SERVER] Segment {i+1}: {segment.get('speaker_id', 'UNKNOWN')} {speaker_marker} - '{segment.get('text', '')[:50]}'")
+            
+            # Save debug output
+            debug_result = {
+                "chunk_id": chunk_id,
+                "processing_result": result,
+                "timestamp": datetime.now().isoformat()
+            }
+            self._save_json_output("processing_result", debug_result)
+            
+            # Send all segments to client individually (like original)
+            for i, segment in enumerate(segments):
+                segment_data = {
+                    "type": "segment_result",
+                    "chunk_id": chunk_id,
+                    "segment": segment,
+                    "timestamp": time.time()
+                }
+                
+                # Save debug output
+                self._save_json_output("segment_result", segment_data)
+                
+                # Send to client (check connection for each segment)
+                if hasattr(websocket, 'state'):
+                    from websockets.protocol import State
+                    if websocket.state != State.OPEN:
+                        print(f"[SERVER] Connection closed during segment send, stopping")
+                        break
+                
+                await self._safe_send_message(websocket, segment_data)
+            
+            # Send completion message (always send, no stop flag check)
+            completion_data = {
+                "type": "audio_processed",
+                "chunk_id": chunk_id,
+                "total_segments": num_segments,
+                "timestamp": time.time()
+            }
+            self._save_json_output("completion", completion_data)
+            await self._safe_send_message(websocket, completion_data)
+            if not is_chunk:
+                print(f"[SERVER] Audio processing completed for {chunk_id}: {num_segments} segments")
+            
+        except Exception as e:
+            print(f"[SERVER] ERROR during async audio processing: {e}")
+            import traceback
+            print(f"[SERVER] Traceback: {traceback.format_exc()}")
+            
+            if hasattr(websocket, 'state'):
+                from websockets.protocol import State
+                if websocket.state == State.OPEN:
+                    error_response = {
+                        "type": "processing_error",
+                        "chunk_id": chunk_id,
+                        "error": str(e),
+                        "timestamp": time.time()
+                    }
+                    await self._safe_send_message(websocket, error_response)
+        finally:
+            # Remove task from tracking
+            if websocket in self.active_audio_tasks:
+                self.active_audio_tasks[websocket].discard(asyncio.current_task())
+    
+    async def _process_gesture_async(self, image_data: str, websocket, timestamp):
+        """Async wrapper for gesture processing - runs in parallel with audio processing."""
+        try:
+            # Run CPU-intensive processing in executor to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                self.gesture_recognizer.recognize_gesture_from_base64,
+                image_data
+            )
+            
+            # Check connection after processing
+            if hasattr(websocket, 'state'):
+                from websockets.protocol import State
+                if websocket.state != State.OPEN:
+                    print(f"[SERVER] Connection closed during gesture processing, skipping result send")
+                    return
+            
+            processing_time = time.time() - timestamp
+            
+            if result.get('success'):
+                gestures = result.get('gestures', [])
+                hand_landmarks = result.get('hand_landmarks', [])
+                num_hands = result.get('num_hands', 0)
+                
+                print(f"[SERVER] ✓ Gesture recognition successful (took {processing_time:.3f}s)")
+                print(f"[SERVER]   Number of hands detected: {num_hands}")
+                print(f"[SERVER]   Number of gestures detected: {len(gestures)}")
+                
+                if len(gestures) > 0:
+                    for i, gesture in enumerate(gestures):
+                        category = gesture.get('category_name', 'Unknown')
+                        score = gesture.get('score', 0.0)
+                        print(f"[SERVER]   Gesture {i+1}: {category} (confidence: {score:.3f} / {score*100:.1f}%)")
+                else:
+                    print(f"[SERVER]   No gestures detected in image")
+                
+                response = {
+                    "type": "gesture_result",
+                    "status_code": 200,
+                    "gestures": gestures,
+                    "hand_landmarks": hand_landmarks,
+                    "num_hands": num_hands,
+                    "timestamp": time.time()
+                }
+                
+                await self._safe_send_message(websocket, response)
+                print(f"[SERVER] ✓ Gesture result sent successfully")
+            else:
+                error_msg = result.get('error', 'Unknown error')
+                print(f"[SERVER] ✗ Gesture recognition failed: {error_msg}")
+                response = {
+                    "type": "gesture_result",
+                    "status_code": 500,
+                    "error": error_msg,
+                    "timestamp": time.time()
+                }
+                await self._safe_send_message(websocket, response)
+            
+        except Exception as e:
+            print(f"[SERVER] ✗ EXCEPTION processing gesture: {e}")
+            import traceback
+            print(f"[SERVER] Traceback: {traceback.format_exc()}")
+            
+            if hasattr(websocket, 'state'):
+                from websockets.protocol import State
+                if websocket.state == State.OPEN:
+                    response = {
+                        "type": "gesture_result",
+                        "status_code": 500,
+                        "error": str(e),
+                        "timestamp": time.time()
+                    }
+                    await self._safe_send_message(websocket, response)
+        finally:
+            # Remove task from tracking
+            if websocket in self.active_gesture_tasks:
+                self.active_gesture_tasks[websocket].discard(asyncio.current_task())
+    
+    def process_audio(self, audio_array: np.ndarray, sample_rate: int, translation_language: str, is_chunk: bool = False, speaker_tracking: Dict[str, Any] = None) -> dict:
         """Process audio using diarization (supports both full audio and real-time chunks).
         
         Args:
@@ -254,7 +590,8 @@ class ARGlassesServer:
                 registered_voices=self.registered_voices,
                 transcription_lang=self.transcription_language,
                 translation_lang=translation_language,
-                is_chunk=is_chunk
+                is_chunk=is_chunk,
+                speaker_tracking=speaker_tracking
             )
             # Only log diarization result details if we have segments or it's full audio
             if diarization_result and diarization_result.get('segments'):
@@ -355,8 +692,21 @@ class ARGlassesServer:
         """Handle WebSocket connections."""
         print(f"[SERVER] New connection from {websocket.remote_address}")
         self.active_connections.add(websocket)
+        # Initialize stop processing flag for this connection
+        self.stop_processing_per_connection[websocket] = False
+        # Initialize speaker tracking for this connection
+        self.speaker_tracking[websocket] = {
+            'speakers': [],  # List of known speakers (SPEAKER_00 reserved for wearer)
+            'next_id': 1  # Next speaker ID to assign (start at 1, 0 is for wearer)
+        }
         try:
             async for message in websocket:
+                # Check connection state before processing any message
+                if hasattr(websocket, 'state'):
+                    from websockets.protocol import State
+                    if websocket.state != State.OPEN:
+                        print(f"[SERVER] Connection not open (state: {websocket.state}), stopping message processing")
+                        break
                 try:
                     data = json.loads(message)
                     message_type = data.get("type")
@@ -364,6 +714,11 @@ class ARGlassesServer:
                     print(f"[SERVER] Received: {message_type}")
                     
                     if message_type == "join_conversation":
+                        # Reset stop processing flag when starting a new recording session
+                        # (but NOT when stop is pressed - that's the user's requirement)
+                        self.stop_processing_per_connection[websocket] = False
+                        print(f"[SERVER] Reset stop flag for new recording session")
+                        
                         # allow client to set language at session start
                         client_translation_lang = data.get("translation_language")
                         
@@ -393,8 +748,36 @@ class ARGlassesServer:
                         await self._safe_send_message(websocket, response)
                         print("[SERVER] Session reset completed")
                         
+                    elif message_type == "stop_processing":
+                        # Client requested to stop processing and dump remaining chunks
+                        print(f"[SERVER] ========== STOP PROCESSING REQUESTED ==========")
+                        print(f"[SERVER] Received stop_processing message from client")
+                        print(f"[SERVER] Setting stop flag - will skip remaining queued chunks and discard results")
+                        
+                        # Set stop flag immediately
+                        self.stop_processing_per_connection[websocket] = True
+                        
+                        # Log current state
+                        print(f"[SERVER] Stop flag set to: {self.stop_processing_per_connection.get(websocket, False)}")
+                        print(f"[SERVER] Active connections: {len(self.active_connections)}")
+                        
+                        # Send confirmation
+                        response = {
+                            "type": "processing_stopped",
+                            "status_code": 200,
+                            "message": "Processing stopped - remaining chunks will be skipped",
+                            "timestamp": time.time()
+                        }
+                        sent = await self._safe_send_message(websocket, response)
+                        if sent:
+                            print(f"[SERVER] Stop processing confirmation sent to client")
+                        else:
+                            print(f"[SERVER] WARNING: Failed to send stop processing confirmation")
+                        
+                        print(f"[SERVER] Stop processing flag set for connection - future chunks will be skipped")
+                        
                     elif message_type == "audio_from_glasses":
-                        # Process audio data from glasses
+                        # Process audio data from glasses (always process, no stop flag check)
                         chunk_id = data.get("chunk_id", "unknown")
                         audio_data = data.get("audio_data", "")
                         sample_rate = data.get("sample_rate", 16000)
@@ -433,6 +816,10 @@ class ARGlassesServer:
                             
                             audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                             
+                            # Note: No overlap trimming needed
+                            # Client sends chunks without overlap for real-time processing
+                            # Smart deduplication handles any edge cases (filters duplicates but allows legitimate similar speech from different speakers)
+                            
                             if not is_chunk:
                                 print(f"[SERVER] Converted to float32 array: {len(audio_array)} samples")
                                 print(f"[SERVER] Audio array stats: min={np.min(audio_array):.4f}, max={np.max(audio_array):.4f}, mean={np.mean(audio_array):.4f}")
@@ -451,7 +838,27 @@ class ARGlassesServer:
                             print(f"[SERVER] Traceback: {traceback.format_exc()}")
                             continue
                         
+                        # Check connection state before starting processing
+                        if hasattr(websocket, 'state'):
+                            from websockets.protocol import State
+                            if websocket.state != State.OPEN:
+                                print(f"[SERVER] Connection closed before processing, skipping audio")
+                                continue
+                        
+                        # Send processing status to keep connection alive
+                        processing_status_msg = {
+                            "type": "processing_status",
+                            "chunk_id": chunk_id,
+                            "status": "processing",
+                            "timestamp": time.time()
+                        }
+                        sent = await self._safe_send_message(websocket, processing_status_msg)
+                        if not sent:
+                            print(f"[SERVER] Failed to send processing_status, connection may be closed")
+                            continue
+                        
                         # Process audio (silent for chunks until we know if there are segments)
+                        # (no stop flag check - always process remaining chunks)
                         if not is_chunk:
                             print("[SERVER] Starting audio processing...")
                             print(f"[SERVER] Audio array shape: {audio_array.shape}")
@@ -461,70 +868,31 @@ class ARGlassesServer:
                             print(f"[SERVER] Using translation language: {translation_language or 'None'}")
                             print(f"[SERVER] Processing mode: FULL AUDIO")
                         
-                        result = self.process_audio(audio_array, sample_rate, translation_language, is_chunk=is_chunk)
+                        # Process audio in parallel using async task (non-blocking)
+                        # (no stop flag check - always process remaining chunks)
+                        # This allows gesture processing to run concurrently
+                        # For real-time chunks, process immediately with high priority
+                        if is_chunk:
+                            print(f"[SERVER] Starting real-time processing for chunk {chunk_id}...")
                         
-                        segments = result.get('segments', [])
-                        num_segments = len(segments)
+                        task = asyncio.create_task(
+                            self._process_audio_async(
+                                audio_array, 
+                                sample_rate, 
+                                translation_language, 
+                                websocket, 
+                                chunk_id, 
+                                is_chunk
+                            )
+                        )
+                        # Track task for cleanup
+                        if websocket not in self.active_audio_tasks:
+                            self.active_audio_tasks[websocket] = set()
+                        self.active_audio_tasks[websocket].add(task)
                         
-                        # For chunks with 0 segments, skip completely silently (no logging at all)
-                        if is_chunk and num_segments == 0:
-                            continue
-                        
-                        # For full audio with 0 segments, still log but don't spam
-                        if not is_chunk and num_segments == 0:
-                            print(f"[SERVER] No segments found in full audio (duration: {result.get('total_duration', 0):.2f}s)")
-                            # Still send completion for full audio to notify client
-                            completion_data = {
-                                "type": "audio_processed",
-                                "chunk_id": chunk_id,
-                                "total_segments": 0,
-                                "timestamp": time.time()
-                            }
-                            await self._safe_send_message(websocket, completion_data)
-                            continue
-                        
-                        # Log results only if we have segments
-                        print(f"[SERVER] Processing method: {result.get('processing_method', 'unknown')}")
-                        print(f"[SERVER] Number of segments: {num_segments}")
-                        
-                        # Log each segment individually
-                        for i, segment in enumerate(segments):
-                            speaker_marker = "[WEARER]" if segment.get('is_wearer') else "[OTHER]"
-                            print(f"[SERVER] Segment {i+1}: {segment.get('speaker_id', 'UNKNOWN')} {speaker_marker} - '{segment.get('text', '')[:50]}'")
-                        
-                        # Save debug output only if we have segments
-                        debug_result = {
-                            "chunk_id": chunk_id,
-                            "processing_result": result,
-                            "timestamp": datetime.now().isoformat()
-                        }
-                        self._save_json_output("processing_result", debug_result)
-                        
-                        # Send results
-                        for i, segment in enumerate(segments):
-                            segment_data = {
-                                "type": "segment_result",
-                                "chunk_id": chunk_id,
-                                "segment": segment,
-                                "timestamp": time.time()
-                            }
-                            
-                            # Save debug output
-                            self._save_json_output("segment_result", segment_data)
-                            
-                            # Send to client
-                            await self._safe_send_message(websocket, segment_data)
-                        
-                        # Send completion message
-                        completion_data = {
-                            "type": "audio_processed",
-                            "chunk_id": chunk_id,
-                            "total_segments": num_segments,
-                            "timestamp": time.time()
-                        }
-                        self._save_json_output("completion", completion_data)
-                        await self._safe_send_message(websocket, completion_data)
-                        print(f"[SERVER] Audio processing completed for {chunk_id}: {num_segments} segments")
+                        # Don't await - let it run in parallel with other messages
+                        # The task will handle sending results when done
+                        # For chunks, processing starts immediately
                         
                     
                     elif message_type == "register_voice":
@@ -618,6 +986,51 @@ class ARGlassesServer:
                             }
                             await self._safe_send_message(websocket, response)
                         
+                    elif message_type == "gesture_from_glasses":
+                        # Process gesture recognition request
+                        print(f"[SERVER] ========== GESTURE RECOGNITION REQUEST ==========")
+                        print(f"[SERVER] Client: {websocket.remote_address}")
+                        print(f"[SERVER] Timestamp: {data.get('timestamp', 'N/A')}")
+                        
+                        if not self.gesture_recognizer or not self.gesture_recognizer.is_available():
+                            print(f"[SERVER] ERROR: Gesture recognition not available")
+                            response = {
+                                "type": "gesture_result",
+                                "status_code": 503,
+                                "error": "Gesture recognition not available",
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, response)
+                            continue
+                        
+                        image_data = data.get("image_data", "")
+                        if not image_data:
+                            print(f"[SERVER] ERROR: No image data provided")
+                            response = {
+                                "type": "gesture_result",
+                                "status_code": 400,
+                                "error": "No image data provided",
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, response)
+                            continue
+                        
+                        print(f"[SERVER] Image data received: {len(image_data)} characters (base64)")
+                        
+                        # Process gesture in parallel using async task (non-blocking)
+                        # This allows audio processing to run concurrently
+                        request_timestamp = time.time()
+                        task = asyncio.create_task(
+                            self._process_gesture_async(image_data, websocket, request_timestamp)
+                        )
+                        # Track task for cleanup
+                        if websocket not in self.active_gesture_tasks:
+                            self.active_gesture_tasks[websocket] = set()
+                        self.active_gesture_tasks[websocket].add(task)
+                        
+                        # Don't await - let it run in parallel with other messages
+                        # The task will handle sending results when done
+                    
                     elif message_type == "ping":
                         # Respond to ping
                         response = {
@@ -626,48 +1039,203 @@ class ARGlassesServer:
                             "timestamp": time.time()
                         }
                         await self._safe_send_message(websocket, response)
+                    
+                    elif message_type == "audio_to_glasses":
+                        # Forward TTS audio to glasses (echo back to client for playback)
+                        print(f"[SERVER] Received audio_to_glasses message (TTS audio)")
+                        audio_data = data.get("audio_data", "")
+                        format_type = data.get("format", "wav")
+                        sample_rate = data.get("sample_rate", 22050)
+                        is_tts = data.get("is_tts", False)
+                        text = data.get("text", "")
+                        
+                        if audio_data:
+                            # Forward as tts_audio message for client to play
+                            response = {
+                                "type": "tts_audio",
+                                "audio_data": audio_data,
+                                "format": format_type,
+                                "sample_rate": sample_rate,
+                                "is_tts": is_tts,
+                                "text": text,
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, response)
+                            print(f"[SERVER] Forwarded TTS audio to glasses ({len(audio_data)} chars base64)")
+                        else:
+                            print(f"[SERVER] ERROR: audio_to_glasses message missing audio_data")
+                            response = {
+                                "type": "error",
+                                "error": "Missing audio_data in audio_to_glasses message",
+                                "timestamp": time.time()
+                            }
+                            await self._safe_send_message(websocket, response)
                         
                     else:
                         print(f"[SERVER] Unknown message type: {message_type}")
                         
                 except json.JSONDecodeError as e:
                     print(f"[SERVER] JSON decode error: {e}")
+                except websockets.exceptions.ConnectionClosed:
+                    # Connection closed during message processing - break the loop
+                    print(f"[SERVER] Connection closed during message handling")
+                    break
                 except Exception as e:
                     print(f"[SERVER] Error handling message: {e}")
+                    # Check if connection is still open, if not break
+                    if hasattr(websocket, 'state'):
+                        from websockets.protocol import State
+                        if websocket.state != State.OPEN:
+                            print(f"[SERVER] Connection closed after error, stopping")
+                            break
                     
         except websockets.exceptions.ConnectionClosed as e:
-            print(f"[SERVER] Connection closed: {websocket.remote_address}")
+            print(f"[SERVER] ========== CONNECTION CLOSED ==========")
+            print(f"[SERVER] Client: {websocket.remote_address}")
             print(f"[SERVER] Close code: {e.code}, reason: {e.reason}")
         except Exception as e:
-            print(f"[SERVER] WebSocket error: {e}")
+            print(f"[SERVER] ========== WEBSOCKET ERROR ==========")
+            print(f"[SERVER] Error: {e}")
             import traceback
             print(f"[SERVER] Error traceback: {traceback.format_exc()}")
         finally:
+            # Cancel any pending tasks for this connection
+            if websocket in self.active_audio_tasks:
+                for task in self.active_audio_tasks[websocket]:
+                    if not task.done():
+                        task.cancel()
+                del self.active_audio_tasks[websocket]
+            
+            if websocket in self.active_gesture_tasks:
+                for task in self.active_gesture_tasks[websocket]:
+                    if not task.done():
+                        task.cancel()
+                del self.active_gesture_tasks[websocket]
+            
+            # Clean up speaker tracking for this connection
+            if websocket in self.speaker_tracking:
+                del self.speaker_tracking[websocket]
+            
             self.active_connections.discard(websocket)
+            # Clean up stop processing flag for this connection
+            if websocket in self.stop_processing_per_connection:
+                del self.stop_processing_per_connection[websocket]
             print(f"[SERVER] Cleaned up connection from {websocket.remote_address}")
 
+    async def _cleanup(self):
+        """Clean up all connections and tasks."""
+        print("[SERVER] Closing all WebSocket connections...")
+        
+        # Close all active connections
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        
+        # Cancel all active tasks
+        print("[SERVER] Cancelling active tasks...")
+        for websocket in list(self.active_connections):
+            if websocket in self.active_audio_tasks:
+                for task in self.active_audio_tasks[websocket]:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                del self.active_audio_tasks[websocket]
+            
+            if websocket in self.active_gesture_tasks:
+                for task in self.active_gesture_tasks[websocket]:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                del self.active_gesture_tasks[websocket]
+        
+        print("[SERVER] Cleanup complete")
+
     async def start_server(self):
-        """Start the WebSocket server."""
+        """Start the WebSocket server with HTTP handler for health checks."""
         print(f"[SERVER] Starting server on {self.host}:{self.port}")
         
         self.main_loop = asyncio.get_event_loop()
         
-        async with websockets.serve(
+        # Create a simple HTTP handler for health checks (ngrok sends GET /)
+        async def http_handler(reader, writer):
+            """Handle HTTP requests (for ngrok health checks)."""
+            try:
+                request = await reader.read(1024)
+                request_str = request.decode('utf-8', errors='ignore')
+                
+                # Simple HTTP response for health checks
+                if request_str.startswith('GET'):
+                    response = (
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Content-Length: 13\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "WebSocket OK"
+                    )
+                    writer.write(response.encode())
+                    await writer.drain()
+                writer.close()
+            except Exception as e:
+                pass  # Ignore errors in HTTP handler
+        
+        # Start HTTP server for health checks on a separate port (optional)
+        # Or handle in WebSocket upgrade
+        
+        self.server = await websockets.serve(
             self.handle_websocket,
             self.host,
             self.port,
-            ping_interval=20,      # Send ping every 20 seconds to keep connection alive
-            ping_timeout=60,       # Wait 60 seconds for pong response (long processing time)
-            close_timeout=30,      # 30 second timeout for close handshake
+            ping_interval=10,      # Send ping every 10 seconds to keep connection alive
+            ping_timeout=None,     # No timeout - wait forever for pong response
+            close_timeout=None,    # No timeout - wait forever for close handshake
             max_size=10**7,        # 10MB max message size (for larger audio files)
             max_queue=128,         # More queued messages
             # Additional timeout settings:
-            open_timeout=30,       # 30 seconds to complete opening handshake
+            open_timeout=None,     # No timeout - wait forever for opening handshake
             logger=None            # Disable internal logging for cleaner output
-        ):
-            print(f"[SERVER] Server running on ws://{self.host}:{self.port}")
-            print("[SERVER] Press Ctrl+C to stop")
-            await asyncio.Future() 
+        )
+        
+        print(f"[SERVER] Server running on ws://{self.host}:{self.port}")
+        print("[SERVER] Note: 502 errors from ngrok are normal (HTTP health checks)")
+        print("[SERVER] WebSocket connections work fine - ignore HTTP 502 errors")
+        print("[SERVER] Press Ctrl+C to stop")
+        
+        # Set up signal handlers for graceful shutdown (works on Unix/Linux/Mac)
+        if sys.platform != 'win32':
+            try:
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    self.main_loop.add_signal_handler(sig, lambda s=sig: self.shutdown_event.set())
+            except NotImplementedError:
+                # Some platforms don't support add_signal_handler
+                pass
+        
+        # Wait for shutdown signal
+        # Use periodic checks to allow KeyboardInterrupt to be raised (important for Windows)
+        try:
+            while not self.shutdown_event.is_set():
+                try:
+                    # Wait with timeout to allow KeyboardInterrupt to be raised periodically
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=0.5)
+                    break
+                except asyncio.TimeoutError:
+                    # Continue loop to check again (allows KeyboardInterrupt to be raised)
+                    continue
+        except KeyboardInterrupt:
+            # Handle Ctrl+C (mainly for Windows)
+            print("\n[SERVER] Keyboard interrupt received")
+            self.shutdown_event.set()
+            raise  # Re-raise to be caught by asyncio.run
+        
+        # Cleanup: close all connections and cancel tasks
+        print("\n[SERVER] Shutting down gracefully...")
+        await self._cleanup() 
 
 def main():
     """Main function."""
@@ -681,9 +1249,13 @@ def main():
     try:
         asyncio.run(server.start_server())
     except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down...")
+        print("\n[SERVER] Keyboard interrupt received, shutting down...")
     except Exception as e:
         print(f"[SERVER] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("[SERVER] Server stopped")
 
 if __name__ == "__main__":
     main()

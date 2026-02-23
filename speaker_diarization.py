@@ -19,7 +19,7 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 class DiarizationPipeline:
-    def __init__(self, hf_token: str, transcription_lang: str = "zh"):
+    def __init__(self, hf_token: str, transcription_lang: str = "zh-hk"):
         """Initialize the diarization pipeline with performance improvements.
         
         Args:
@@ -59,10 +59,12 @@ class DiarizationPipeline:
         
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # Use int8 for memory efficiency (original setting)
+        # For better accuracy, you can use "float16" on GPU or "float32" for maximum accuracy
         self.whisper_model = WhisperModel(
             "large-v3",
             device=device_str,
-            compute_type="int8",  # Use int8 for maximum memory efficiency
+            compute_type="int8",  # Use int8 for maximum memory efficiency (original setting)
             num_workers=1,  # Limit workers to save memory
             download_root=None,  # Use default cache
             local_files_only=False
@@ -107,7 +109,7 @@ class DiarizationPipeline:
             torch.cuda.empty_cache()
     
     def extract_multiple_embeddings(self, audio_array: np.ndarray, sample_rate: int = 16000, 
-                                   segment_duration: float = 1.5) -> List[np.ndarray]:
+                                   segment_duration: float = 1.0) -> List[np.ndarray]:
         """
         Extract multiple 192-dim embeddings from audio by segmenting it.
         This creates a more robust voice profile by capturing variations.
@@ -140,7 +142,7 @@ class DiarizationPipeline:
             
             embeddings = []
             segment_samples = int(segment_duration * sample_rate)
-            overlap_samples = int(0.5 * sample_rate)  # 0.5s overlap
+            overlap_samples = int(0.3 * sample_rate)  # 0.3s overlap (30% overlap for more samples)
             
             start_idx = 0
             segment_num = 0
@@ -150,7 +152,7 @@ class DiarizationPipeline:
                 segment_audio = audio_array[start_idx:end_idx].copy()  # Copy to avoid modifying original
                 
                 # Skip if segment too short
-                if len(segment_audio) < sample_rate * 0.8:  # Minimum 0.8 seconds
+                if len(segment_audio) < sample_rate * 0.6:  # Minimum 0.6 seconds (reduced for more samples)
                     print(f"[DIARIZATION] Segment {segment_num+1}: Too short, skipping")
                     break
                 
@@ -245,12 +247,14 @@ class DiarizationPipeline:
             
             # Check audio energy BEFORE normalization
             rms_energy = np.sqrt(np.mean(audio_array**2))
-            print(f"[DIARIZATION] Audio RMS energy (before norm): {rms_energy:.6f}")
+            if len(audio_array) / sample_rate > 3.0:  # Only log for longer audio
+                print(f"[DIARIZATION] Audio RMS energy (before norm): {rms_energy:.6f}")
             
             # Normalize to [-1, 1] range
             if np.max(np.abs(audio_array)) > 0:
                 audio_array = audio_array / np.max(np.abs(audio_array))
-                print(f"[DIARIZATION] Audio normalized to range: [{np.min(audio_array):.4f}, {np.max(audio_array):.4f}]")
+                if len(audio_array) / sample_rate > 3.0:  # Only log for longer audio
+                    print(f"[DIARIZATION] Audio normalized to range: [{np.min(audio_array):.4f}, {np.max(audio_array):.4f}]")
             
             # Convert to torch tensor [1, samples]
             audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)
@@ -260,9 +264,10 @@ class DiarizationPipeline:
                 embedding = self.speaker_model.encode_batch(audio_tensor)
                 embedding = embedding.squeeze().cpu().numpy()  # Shape: (192,)
             
-            print(f"[DIARIZATION] ✓ Embedding extracted successfully!")
-            print(f"[DIARIZATION] Embedding shape: {embedding.shape}")
-            print(f"[DIARIZATION] Embedding stats: mean={np.mean(embedding):.4f}, std={np.std(embedding):.4f}, norm={np.linalg.norm(embedding):.4f}")
+            if len(audio_array) / sample_rate > 3.0:  # Only log for longer audio
+                print(f"[DIARIZATION] ✓ Embedding extracted successfully!")
+                print(f"[DIARIZATION] Embedding shape: {embedding.shape}")
+                print(f"[DIARIZATION] Embedding stats: mean={np.mean(embedding):.4f}, std={np.std(embedding):.4f}, norm={np.linalg.norm(embedding):.4f}")
             
             return embedding
             
@@ -288,15 +293,15 @@ class DiarizationPipeline:
         if audio_segment.dtype != np.float32:
             audio_segment = audio_segment.astype(np.float32)
         
-        # Normalize audio
+        # Normalize audio (simple normalization - original approach)
         if np.max(np.abs(audio_segment)) > 0:
             audio_segment = audio_segment / np.max(np.abs(audio_segment))
-        
         
         return audio_segment
 
     def transcribe_segment(self, audio_segment: np.ndarray, sample_rate: int = 16000, 
-                          transcription_lang: str = None, translation_lang: str = None) -> Dict[str, Any]:
+                          transcription_lang: str = None, translation_lang: str = None,
+                          is_chunk: bool = False) -> Dict[str, Any]:
         """Transcribe a single audio segment using optimized Whisper settings.
         
         Args:
@@ -304,6 +309,7 @@ class DiarizationPipeline:
             sample_rate: Sample rate of audio
             transcription_lang: Language for transcription (uses default if None)
             translation_lang: Target language for translation (no translation if None)
+            is_chunk: If True, use faster settings for real-time processing
         
         Returns:
             Dictionary containing:
@@ -320,12 +326,28 @@ class DiarizationPipeline:
             # Preprocess audio for maximum accuracy
             audio_segment = self.preprocess_audio(audio_segment, sample_rate)
             
-            # Use language-specific Whisper settings
-            segments, info = self.whisper_model.transcribe(
-                audio_segment,
-                language=source_lang,
-                task="transcribe",  # Explicitly set task
-            )
+            # Use faster settings for chunks (real-time processing)
+            if is_chunk:
+                # Maximum speed settings for real-time chunks - prioritize speed over accuracy
+                segments, info = self.whisper_model.transcribe(
+                    audio_segment,
+                    language=source_lang,
+                    task="transcribe",
+                    beam_size=1,  # Greedy decoding - fastest option
+                    best_of=1,    # Single candidate - fastest
+                    temperature=0,  # Deterministic - fastest
+                    vad_filter=False,  # Disable VAD to avoid missing speech at boundaries
+                    condition_on_previous_text=False,  # Disable context for speed
+                    initial_prompt=None,  # No prompt needed for chunks
+                    word_timestamps=False,  # Skip word timestamps for speed
+                )
+            else:
+                # Use language-specific Whisper settings (original settings for best compatibility)
+                segments, info = self.whisper_model.transcribe(
+                    audio_segment,
+                    language=source_lang,
+                    task="transcribe",  # Explicitly set task
+                )
             
             # Combine all segments into one text
             original_text = " ".join([segment.text for segment in segments]).strip()
@@ -393,8 +415,6 @@ class DiarizationPipeline:
         for i, reg_emb in enumerate(registered_embeddings):
             sim = self.compare_embeddings(segment_embedding, reg_emb)
             similarities.append(sim)
-            # Debug: Show each comparison
-            print(f"[DIARIZATION]     Sample {i+1}: similarity = {sim:.4f}")
         
         similarities_array = np.array(similarities)
         
@@ -403,10 +423,8 @@ class DiarizationPipeline:
         avg_sim = np.mean(similarities_array)
         median_sim = np.median(similarities_array)
         
-        # Count how many samples are above threshold (0.65)
-        match_count = np.sum(similarities_array >= 0.65)
-        
-        print(f"[DIARIZATION]   Individual similarities: {[f'{s:.4f}' for s in similarities]}")
+        # Count how many samples are above threshold (0.62 - lowered for more leniency)
+        match_count = np.sum(similarities_array >= 0.62)
         
         return {
             'max_similarity': float(max_sim),
@@ -482,7 +500,8 @@ class DiarizationPipeline:
                            registered_voices: Dict[str, Any] = None,
                            transcription_lang: str = None, 
                            translation_lang: str = None,
-                           is_chunk: bool = False) -> Dict[str, Any]:
+                           is_chunk: bool = False,
+                           speaker_tracking: Dict[str, Any] = None) -> Dict[str, Any]:
         """Process audio array for speaker diarization and transcription.
         
         Args:
@@ -529,14 +548,370 @@ class DiarizationPipeline:
             if not is_chunk:
                 print(f"[DIARIZATION] Audio preprocessed: {len(audio_array)} samples, max={np.max(audio_array):.3f}")
             
+            # FAST PATH: For real-time chunks, skip diarization and use direct transcription
+            if is_chunk:
+                # Skip diarization for chunks - just transcribe the whole chunk directly
+                # This is MUCH faster for real-time processing
+                transcription_result = self.transcribe_segment(
+                    audio_array,
+                    sample_rate,
+                    transcription_lang=transcription_lang,
+                    translation_lang=translation_lang,
+                    is_chunk=True  # Use fast settings
+                )
+                
+                text = transcription_result.get('text', '') if transcription_result else ''
+                original_text = transcription_result.get('original_text', text) if transcription_result else text
+                
+                # Skip only completely empty transcriptions (allow single characters/words)
+                if not text or len(text.strip()) < 1:
+                    return {
+                        'segments': [],
+                        'total_duration': len(audio_array) / sample_rate,
+                        'speaker_count': 0,
+                        'processing_method': 'fast_chunk_transcription',
+                        'is_chunk': True
+                    }
+                
+                # Filter out hallucination segments - skip entire segment if detected
+                # Check both text and original_text, and normalize whitespace for matching
+                skip_segment_patterns = [
+                    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+                    "请不吝点赞订阅转发打赏支持明镜与点点栏目",  # Without spaces
+                    "明镜与点点栏目",  # Key unique phrase from the hallucination
+                    "谢谢大家"
+                ]
+                
+                # Normalize text for comparison (remove extra whitespace)
+                text_normalized = " ".join(text.split())
+                original_text_normalized = " ".join(original_text.split())
+                
+                for pattern in skip_segment_patterns:
+                    # Check both normalized text fields
+                    if pattern in text_normalized or pattern in original_text_normalized:
+                        print(f"[DIARIZATION] Skipping chunk segment containing hallucination: '{pattern}'")
+                        print(f"[DIARIZATION] Detected in text: '{text[:100]}'")
+                        print(f"[DIARIZATION] Detected in original_text: '{original_text[:100]}'")
+                        return {
+                            'segments': [],
+                            'total_duration': len(audio_array) / sample_rate,
+                            'speaker_count': 0,
+                            'processing_method': 'fast_chunk_transcription',
+                            'is_chunk': True
+                        }
+                
+                # Speaker identification: Track speakers across chunks for consistent IDs
+                is_wearer = False
+                voice_similarity = 0.0
+                speaker_id = 'SPEAKER_01'  # Default to OTHER if no match
+                
+                # Extract embedding from chunk for speaker identification
+                chunk_duration = len(audio_array) / sample_rate
+                chunk_embedding = None
+                
+                # Extract embedding from middle portion for speed
+                if chunk_duration > 1.5:
+                    middle_start = int(len(audio_array) * 0.25)
+                    middle_end = int(len(audio_array) * 0.75)
+                    middle_audio = audio_array[middle_start:middle_end]
+                    chunk_embedding = self.extract_speaker_embedding(middle_audio, sample_rate)
+                else:
+                    chunk_embedding = self.extract_speaker_embedding(audio_array, sample_rate)
+                
+                if chunk_embedding is not None:
+                    # First check if wearer's voice is registered
+                    if has_registered_voice:
+                        voice_id, voice_data = next(iter(registered_voices.items()))
+                        registered_embeddings = voice_data.get('embeddings')
+                        registered_embedding_single = voice_data.get('embedding')
+                        
+                        best_similarity = 0.0
+                        
+                        if registered_embeddings is not None and len(registered_embeddings) > 1:
+                            result = self.compare_with_multiple_embeddings(chunk_embedding, registered_embeddings)
+                            avg_sim = result['avg_similarity']
+                            median_sim = result['median_similarity']
+                            max_sim = result['max_similarity']
+                            match_ratio = result['match_count'] / result['total_samples']
+                            all_sims = np.array(result['all_similarities'])
+                            
+                            best_similarity = median_sim
+                            voice_similarity = best_similarity
+                            
+                            # Check if this is the wearer
+                            if avg_sim >= 0.48 or (median_sim >= 0.46 and max_sim >= 0.55) or \
+                               (match_ratio >= 0.25 and max_sim >= 0.58) or \
+                               (np.sum(all_sims >= 0.48) >= (len(all_sims) * 0.35)):
+                                is_wearer = True
+                                speaker_id = 'SPEAKER_00'  # Wearer is always SPEAKER_00
+                                
+                                # Add wearer to speaker tracking if not already there
+                                if speaker_tracking and 'speakers' in speaker_tracking:
+                                    wearer_exists = any(s.get('id') == 'SPEAKER_00' for s in speaker_tracking['speakers'])
+                                    if not wearer_exists:
+                                        speaker_tracking['speakers'].append({
+                                            'id': 'SPEAKER_00',
+                                            'embedding': chunk_embedding,
+                                            'is_wearer': True
+                                        })
+                                        print(f"[DIARIZATION] Added WEARER (SPEAKER_00) to speaker tracking")
+                                
+                                print(f"[DIARIZATION] Chunk identified as WEARER (SPEAKER_00) - Similarity: {best_similarity:.4f}")
+                            else:
+                                # Not wearer - check against tracked speakers
+                                if speaker_tracking and 'speakers' in speaker_tracking:
+                                    # Compare with known speakers
+                                    best_match_similarity = 0.0
+                                    matched_speaker = None
+                                    
+                                    for known_speaker in speaker_tracking['speakers']:
+                                        if known_speaker.get('is_wearer', False):
+                                            continue  # Skip wearer, already checked
+                                        
+                                        known_emb = known_speaker.get('embedding')
+                                        if known_emb is not None:
+                                            sim = self.compare_embeddings(chunk_embedding, known_emb)
+                                            if sim > best_match_similarity:
+                                                best_match_similarity = sim
+                                                matched_speaker = known_speaker
+                                    
+                                    # Use lower threshold for matching (0.32) to prevent splitting same speaker
+                                    # Lowered from 0.40 to be more aggressive about merging
+                                    if matched_speaker and best_match_similarity >= 0.32:
+                                        speaker_id = matched_speaker['id']
+                                        # Update speaker embedding with running average for stability
+                                        old_emb = matched_speaker['embedding']
+                                        # Weighted average: 70% old, 30% new (keeps it stable but adapts)
+                                        updated_emb = 0.7 * old_emb + 0.3 * chunk_embedding
+                                        matched_speaker['embedding'] = updated_emb
+                                        print(f"[DIARIZATION] Chunk matched to {speaker_id} - Similarity: {best_match_similarity:.4f}")
+                                    else:
+                                        # Before creating new speaker, check if we should merge (0.28-0.32 range)
+                                        if matched_speaker and best_match_similarity >= 0.28 and best_match_similarity < 0.32:
+                                            # Close but below threshold - merge with closest speaker
+                                            speaker_id = matched_speaker['id']
+                                            old_emb = matched_speaker['embedding']
+                                            updated_emb = 0.6 * old_emb + 0.4 * chunk_embedding
+                                            matched_speaker['embedding'] = updated_emb
+                                            print(f"[DIARIZATION] Merged chunk with {speaker_id} (similarity: {best_match_similarity:.4f} - below threshold but close)")
+                                        else:
+                                            # New speaker detected (only if similarity is very low < 0.28)
+                                            next_id = speaker_tracking.get('next_id', 1)
+                                            speaker_id = f'SPEAKER_{next_id:02d}'
+                                            speaker_tracking['speakers'].append({
+                                                'id': speaker_id,
+                                                'embedding': chunk_embedding,
+                                                'is_wearer': False
+                                            })
+                                            speaker_tracking['next_id'] = next_id + 1
+                                            print(f"[DIARIZATION] New speaker detected: {speaker_id} (best match was {best_match_similarity:.4f})")
+                                else:
+                                    # No speaker tracking - default to SPEAKER_01
+                                    speaker_id = 'SPEAKER_01'
+                                    print(f"[DIARIZATION] Chunk identified as OTHER (SPEAKER_01) - Similarity: {best_similarity:.4f}")
+                                    
+                        elif registered_embedding_single is not None:
+                            similarity = self.compare_embeddings(chunk_embedding, registered_embedding_single)
+                            voice_similarity = similarity
+                            
+                            if similarity >= 0.65:
+                                is_wearer = True
+                                speaker_id = 'SPEAKER_00'
+                                
+                                # Add wearer to speaker tracking if not already there
+                                if speaker_tracking and 'speakers' in speaker_tracking:
+                                    wearer_exists = any(s.get('id') == 'SPEAKER_00' for s in speaker_tracking['speakers'])
+                                    if not wearer_exists:
+                                        speaker_tracking['speakers'].append({
+                                            'id': 'SPEAKER_00',
+                                            'embedding': chunk_embedding,
+                                            'is_wearer': True
+                                        })
+                                        print(f"[DIARIZATION] Added WEARER (SPEAKER_00) to speaker tracking")
+                                
+                                print(f"[DIARIZATION] Chunk identified as WEARER (SPEAKER_00) - Similarity: {similarity:.4f}")
+                            else:
+                                # Not wearer - check tracked speakers
+                                if speaker_tracking and 'speakers' in speaker_tracking:
+                                    best_match_similarity = 0.0
+                                    matched_speaker = None
+                                    
+                                    for known_speaker in speaker_tracking['speakers']:
+                                        if known_speaker.get('is_wearer', False):
+                                            continue
+                                        
+                                        known_emb = known_speaker.get('embedding')
+                                        if known_emb is not None:
+                                            sim = self.compare_embeddings(chunk_embedding, known_emb)
+                                            if sim > best_match_similarity:
+                                                best_match_similarity = sim
+                                                matched_speaker = known_speaker
+                                    
+                                    # Use lower threshold for matching (0.32) to prevent splitting same speaker
+                                    # Lowered from 0.40 to be more aggressive about merging
+                                    if matched_speaker and best_match_similarity >= 0.32:
+                                        speaker_id = matched_speaker['id']
+                                        # Update speaker embedding with running average for stability
+                                        old_emb = matched_speaker['embedding']
+                                        updated_emb = 0.7 * old_emb + 0.3 * chunk_embedding
+                                        matched_speaker['embedding'] = updated_emb
+                                        print(f"[DIARIZATION] Chunk matched to {speaker_id} - Similarity: {best_match_similarity:.4f}")
+                                    else:
+                                        # Before creating new speaker, check if we should merge (0.28-0.32 range)
+                                        if matched_speaker and best_match_similarity >= 0.28 and best_match_similarity < 0.32:
+                                            # Close but below threshold - merge with closest speaker
+                                            speaker_id = matched_speaker['id']
+                                            old_emb = matched_speaker['embedding']
+                                            updated_emb = 0.6 * old_emb + 0.4 * chunk_embedding
+                                            matched_speaker['embedding'] = updated_emb
+                                            print(f"[DIARIZATION] Merged chunk with {speaker_id} (similarity: {best_match_similarity:.4f} - below threshold but close)")
+                                        else:
+                                            # Truly new speaker - no max limit, but proactively merge similar speakers
+                                            non_wearer_speakers = [s for s in speaker_tracking['speakers'] if not s.get('is_wearer', False)]
+                                            
+                                            # Proactively merge similar existing speakers before creating new one
+                                            if len(non_wearer_speakers) >= 2:
+                                                # Check if any two speakers are very similar and should be merged
+                                                merged = False
+                                                for i, s1 in enumerate(non_wearer_speakers):
+                                                    for j, s2 in enumerate(non_wearer_speakers[i+1:], start=i+1):
+                                                        sim = self.compare_embeddings(s1['embedding'], s2['embedding'])
+                                                        if sim >= 0.35:  # If very similar, merge them
+                                                            # Merge s2 into s1
+                                                            merged_emb = 0.5 * s1['embedding'] + 0.5 * s2['embedding']
+                                                            s1['embedding'] = merged_emb
+                                                            # Remove s2 from tracking
+                                                            speaker_tracking['speakers'] = [s for s in speaker_tracking['speakers'] if s['id'] != s2['id']]
+                                                            print(f"[DIARIZATION] Merged similar speakers {s2['id']} into {s1['id']} (similarity: {sim:.4f})")
+                                                            merged = True
+                                                            break
+                                                    if merged:
+                                                        break
+                                                # Recalculate after potential merge
+                                                if merged:
+                                                    non_wearer_speakers = [s for s in speaker_tracking['speakers'] if not s.get('is_wearer', False)]
+                                            
+                                            # Create new speaker (no limit)
+                                            next_id = speaker_tracking.get('next_id', 1)
+                                            speaker_id = f'SPEAKER_{next_id:02d}'
+                                            speaker_tracking['speakers'].append({
+                                                'id': speaker_id,
+                                                'embedding': chunk_embedding,
+                                                'is_wearer': False
+                                            })
+                                            speaker_tracking['next_id'] = next_id + 1
+                                            print(f"[DIARIZATION] New speaker detected: {speaker_id} (best match was {best_match_similarity:.4f})")
+                                else:
+                                    speaker_id = 'SPEAKER_01'
+                                    print(f"[DIARIZATION] Chunk identified as OTHER (SPEAKER_01) - Similarity: {similarity:.4f}")
+                    else:
+                        # No registered voice - use speaker tracking only
+                        if speaker_tracking and 'speakers' in speaker_tracking:
+                            best_match_similarity = 0.0
+                            matched_speaker = None
+                            
+                            for known_speaker in speaker_tracking['speakers']:
+                                known_emb = known_speaker.get('embedding')
+                                if known_emb is not None:
+                                    sim = self.compare_embeddings(chunk_embedding, known_emb)
+                                    if sim > best_match_similarity:
+                                        best_match_similarity = sim
+                                        matched_speaker = known_speaker
+                            
+                            # Use lower threshold for matching (0.32) to prevent splitting same speaker
+                            # Lowered from 0.5 to be more aggressive about merging
+                            if matched_speaker and best_match_similarity >= 0.32:
+                                speaker_id = matched_speaker['id']
+                                is_wearer = matched_speaker.get('is_wearer', False)
+                                # Update speaker embedding with running average for stability
+                                old_emb = matched_speaker['embedding']
+                                updated_emb = 0.7 * old_emb + 0.3 * chunk_embedding
+                                matched_speaker['embedding'] = updated_emb
+                                print(f"[DIARIZATION] Chunk matched to {speaker_id} - Similarity: {best_match_similarity:.4f}")
+                            else:
+                                # Before creating new speaker, check if we should merge (0.28-0.32 range)
+                                if matched_speaker and best_match_similarity >= 0.28 and best_match_similarity < 0.32:
+                                    # Close but below threshold - merge with closest speaker
+                                    speaker_id = matched_speaker['id']
+                                    is_wearer = matched_speaker.get('is_wearer', False)
+                                    old_emb = matched_speaker['embedding']
+                                    updated_emb = 0.6 * old_emb + 0.4 * chunk_embedding
+                                    matched_speaker['embedding'] = updated_emb
+                                    print(f"[DIARIZATION] Merged chunk with {speaker_id} (similarity: {best_match_similarity:.4f})")
+                                else:
+                                    # No max speaker limit - proactively merge similar speakers
+                                    non_wearer_speakers = [s for s in speaker_tracking['speakers'] if not s.get('is_wearer', False)]
+                                    
+                                    # Proactively merge similar existing speakers before creating new one
+                                    if len(non_wearer_speakers) >= 2:
+                                        # Check if any two speakers are very similar and should be merged
+                                        merged = False
+                                        for i, s1 in enumerate(non_wearer_speakers):
+                                            for j, s2 in enumerate(non_wearer_speakers[i+1:], start=i+1):
+                                                sim = self.compare_embeddings(s1['embedding'], s2['embedding'])
+                                                if sim >= 0.35:  # If very similar, merge them
+                                                    # Merge s2 into s1
+                                                    merged_emb = 0.5 * s1['embedding'] + 0.5 * s2['embedding']
+                                                    s1['embedding'] = merged_emb
+                                                    # Remove s2 from tracking
+                                                    speaker_tracking['speakers'] = [s for s in speaker_tracking['speakers'] if s['id'] != s2['id']]
+                                                    print(f"[DIARIZATION] Merged similar speakers {s2['id']} into {s1['id']} (similarity: {sim:.4f})")
+                                                    merged = True
+                                                    break
+                                            if merged:
+                                                break
+                                        # Recalculate after potential merge
+                                        if merged:
+                                            non_wearer_speakers = [s for s in speaker_tracking['speakers'] if not s.get('is_wearer', False)]
+                                    
+                                    # Create new speaker (no limit)
+                                    next_id = speaker_tracking.get('next_id', 1)
+                                    speaker_id = f'SPEAKER_{next_id:02d}'
+                                    speaker_tracking['speakers'].append({
+                                        'id': speaker_id,
+                                        'embedding': chunk_embedding,
+                                        'is_wearer': False
+                                    })
+                                    speaker_tracking['next_id'] = next_id + 1
+                                    print(f"[DIARIZATION] New speaker detected: {speaker_id} (best match was {best_match_similarity:.4f})")
+                        else:
+                            # No tracking available - default
+                            speaker_id = 'SPEAKER_00'
+                
+                # Create single segment for the chunk
+                segment_data = {
+                    'speaker_id': speaker_id,
+                    'transcription': text,
+                    'start': 0.0,
+                    'end': len(audio_array) / sample_rate,
+                    'duration': len(audio_array) / sample_rate,
+                    'confidence': 0.85,
+                    'original_text': transcription_result.get('original_text', text),
+                    'translated': transcription_result.get('translated', False),
+                    'source_lang': transcription_result.get('source_lang', transcription_lang or self.transcription_lang),
+                    'is_wearer': is_wearer,
+                    'voice_similarity': voice_similarity
+                }
+                
+                if transcription_result.get('target_lang'):
+                    segment_data['target_lang'] = transcription_result.get('target_lang')
+                
+                return {
+                    'segments': [segment_data],
+                    'total_duration': len(audio_array) / sample_rate,
+                    'speaker_count': 1,
+                    'processing_method': 'fast_chunk_transcription',
+                    'is_chunk': True
+                }
+            
+            # FULL PATH: For full audio, use full diarization
             # Create temporary file for diarization (required by pyannote)
             temp_file = f"temp_audio_{int(time.time() * 1000)}.wav"
             sf.write(temp_file, audio_array, sample_rate)
             
             try:
-                # Perform speaker diarization (silent for chunks)
-                if not is_chunk:
-                    print("[DIARIZATION] Running speaker diarization...")
+                # Perform speaker diarization
+                print("[DIARIZATION] Running speaker diarization...")
                 diarization = self.diarization_pipeline(temp_file)
                 
                 # Debug: Print all detected speakers and their segments
@@ -646,7 +1021,8 @@ class DiarizationPipeline:
                             segment_audio, 
                             sample_rate,
                             transcription_lang=transcription_lang,
-                            translation_lang=translation_lang
+                            translation_lang=translation_lang,
+                            is_chunk=False  # Full audio uses normal settings
                         )
                         
                         # Cache the text result
@@ -660,11 +1036,39 @@ class DiarizationPipeline:
                     
                     # Extract text from result
                     text = transcription_result.get('text', '') if transcription_result else ''
+                    original_text = transcription_result.get('original_text', text) if transcription_result else text
                     
                     # Filter out empty or very short transcriptions
                     if not text or len(text.strip()) < 2:  # Increased from 1 to 2 - skip single character
                         print(f"[OPTIMIZED] Skipping empty/short text: '{text}'")
                         skipped_empty += 1
+                        continue
+                    
+                    # Filter out hallucination segments - skip entire segment if detected
+                    # Check both text and original_text, and normalize whitespace for matching
+                    skip_segment_patterns = [
+                        "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+                        "请不吝点赞订阅转发打赏支持明镜与点点栏目",  # Without spaces
+                        "明镜与点点栏目",  # Key unique phrase from the hallucination
+                        "谢谢大家"
+                    ]
+                    
+                    # Normalize text for comparison (remove extra whitespace)
+                    text_normalized = " ".join(text.split())
+                    original_text_normalized = " ".join(original_text.split())
+                    
+                    should_skip = False
+                    for pattern in skip_segment_patterns:
+                        # Check both normalized text fields
+                        if pattern in text_normalized or pattern in original_text_normalized:
+                            print(f"[DIARIZATION] Skipping segment containing hallucination: '{pattern}'")
+                            print(f"[DIARIZATION] Detected in text: '{text[:100]}'")
+                            print(f"[DIARIZATION] Detected in original_text: '{original_text[:100]}'")
+                            skipped_empty += 1
+                            should_skip = True
+                            break
+                    
+                    if should_skip:
                         continue
                     
                     # Filter out hallucination text from the segment (not the whole segment)
@@ -768,24 +1172,24 @@ class DiarizationPipeline:
                                 
                                 # Multiple criteria for detection (prevents false positives)
                                 
-                                # Criterion 1: High average (most reliable)
-                                if avg_sim >= 0.55:
+                                # Criterion 1: High average (most reliable) - slightly lowered for more leniency
+                                if avg_sim >= 0.52:
                                     is_wearer = True
                                     confidence_pct = avg_sim * 100
                                     print(f"[DIARIZATION] WEARER (AVG MATCH) - Avg: {confidence_pct:.1f}%, Median: {median_sim:.4f}")
                                 
-                                # Criterion 2: Good median + at least one strong match
-                                elif median_sim >= 0.52 and max_sim >= 0.60:
+                                # Criterion 2: Good median + at least one strong match - slightly lowered
+                                elif median_sim >= 0.50 and max_sim >= 0.58:
                                     is_wearer = True
                                     print(f"[DIARIZATION] WEARER (MEDIAN+MAX) - Median: {median_sim:.4f}, Max: {max_sim:.4f}")
                                 
-                                # Criterion 3: At least 2 samples match well (40% of samples)
-                                elif match_ratio >= 0.4 and max_sim >= 0.65:
+                                # Criterion 3: At least 30% of samples match well (lowered from 40%)
+                                elif match_ratio >= 0.3 and max_sim >= 0.62:
                                     is_wearer = True
                                     print(f"[DIARIZATION] WEARER (VOTE MATCH) - {match_count}/{total_samples} samples, Max: {max_sim:.4f}")
                                 
-                                # Criterion 4: At least half of samples are somewhat similar (>= 0.50)
-                                elif np.sum(all_sims >= 0.50) >= (total_samples / 2):
+                                # Criterion 4: At least 40% of samples are somewhat similar (>= 0.50) - lowered from 50%
+                                elif np.sum(all_sims >= 0.50) >= (total_samples * 0.4):
                                     is_wearer = True
                                     matches_50 = int(np.sum(all_sims >= 0.50))
                                     print(f"[DIARIZATION] WEARER (MAJORITY) - {matches_50}/{total_samples} above 0.50, Avg: {avg_sim:.4f}")
