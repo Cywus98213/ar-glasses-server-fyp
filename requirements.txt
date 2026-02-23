@@ -22,3 +22,8 @@ speechbrain>=0.5.16,<0.6.0
 sentencepiece>=0.1.99
 hyperpyyaml>=1.1.0
 librosa>=0.9.0,<0.11.0
+
+# Gesture recognition
+mediapipe>=0.10.0
+opencv-contrib-python>=4.5.0,<4.9.0  # MediaPipe requires contrib version
+Pillow>=9.0.0
