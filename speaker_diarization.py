@@ -13,6 +13,7 @@ from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
 from speechbrain.pretrained import EncoderClassifier
 from translation_module import TranslationModule
+from threshold_settings import ThresholdSettings
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -29,6 +30,9 @@ class DiarizationPipeline:
         print("[DIARIZATION] Initializing Diarization Pipeline...")
         
         os.environ["HF_TOKEN"] = hf_token
+
+        # Centralized, env-driven thresholds (defaults match previous behavior)
+        self.thresholds = ThresholdSettings.from_env()
         
         # Store default transcription language
         self.transcription_lang = transcription_lang
@@ -45,11 +49,11 @@ class DiarizationPipeline:
         try:
             self.diarization_pipeline.instantiate({
                 "clustering": {
-                    "threshold": 0.5,  
-                    "min_cluster_size": 2,  
+                    "threshold": self.thresholds.diar_clustering_threshold,
+                    "min_cluster_size": self.thresholds.diar_min_cluster_size,
                 },
                 "segmentation": {
-                    "min_duration_off": 0.5,  
+                    "min_duration_off": self.thresholds.diar_min_duration_off,
                 }
             })
             print("[DIARIZATION] Diarization configured to reduce false speakers")
@@ -423,8 +427,8 @@ class DiarizationPipeline:
         avg_sim = np.mean(similarities_array)
         median_sim = np.median(similarities_array)
         
-        # Count how many samples are above threshold (0.62 - lowered for more leniency)
-        match_count = np.sum(similarities_array >= 0.62)
+        vote_thr = self.thresholds.wearer_multi_vote_sim_threshold
+        match_count = np.sum(similarities_array >= vote_thr)
         
         return {
             'max_similarity': float(max_sim),
@@ -638,10 +642,11 @@ class DiarizationPipeline:
                             best_similarity = median_sim
                             voice_similarity = best_similarity
                             
-                            # Check if this is the wearer
-                            if avg_sim >= 0.48 or (median_sim >= 0.46 and max_sim >= 0.55) or \
-                               (match_ratio >= 0.25 and max_sim >= 0.58) or \
-                               (np.sum(all_sims >= 0.48) >= (len(all_sims) * 0.35)):
+                            t = self.thresholds
+                            if avg_sim >= t.wearer_chunk_avg_threshold or \
+                               (median_sim >= t.wearer_chunk_median_threshold and max_sim >= t.wearer_chunk_max_threshold) or \
+                               (match_ratio >= t.wearer_chunk_match_ratio_threshold and max_sim >= t.wearer_chunk_match_ratio_max_threshold) or \
+                               (np.sum(all_sims >= t.wearer_chunk_count_sim_threshold) >= (len(all_sims) * t.wearer_chunk_count_ratio_threshold)):
                                 is_wearer = True
                                 speaker_id = 'SPEAKER_00'  # Wearer is always SPEAKER_00
                                 
@@ -675,9 +680,8 @@ class DiarizationPipeline:
                                                 best_match_similarity = sim
                                                 matched_speaker = known_speaker
                                     
-                                    # Use lower threshold for matching (0.32) to prevent splitting same speaker
-                                    # Lowered from 0.40 to be more aggressive about merging
-                                    if matched_speaker and best_match_similarity >= 0.32:
+                                    t = self.thresholds
+                                    if matched_speaker and best_match_similarity >= t.speaker_match_threshold:
                                         speaker_id = matched_speaker['id']
                                         # Update speaker embedding with running average for stability
                                         old_emb = matched_speaker['embedding']
@@ -686,8 +690,8 @@ class DiarizationPipeline:
                                         matched_speaker['embedding'] = updated_emb
                                         print(f"[DIARIZATION] Chunk matched to {speaker_id} - Similarity: {best_match_similarity:.4f}")
                                     else:
-                                        # Before creating new speaker, check if we should merge (0.28-0.32 range)
-                                        if matched_speaker and best_match_similarity >= 0.28 and best_match_similarity < 0.32:
+                                        t = self.thresholds
+                                        if matched_speaker and (t.speaker_merge_band_low <= best_match_similarity < t.speaker_merge_band_high):
                                             # Close but below threshold - merge with closest speaker
                                             speaker_id = matched_speaker['id']
                                             old_emb = matched_speaker['embedding']
@@ -695,7 +699,7 @@ class DiarizationPipeline:
                                             matched_speaker['embedding'] = updated_emb
                                             print(f"[DIARIZATION] Merged chunk with {speaker_id} (similarity: {best_match_similarity:.4f} - below threshold but close)")
                                         else:
-                                            # New speaker detected (only if similarity is very low < 0.28)
+                                            # New speaker detected (only if similarity is very low < merge band low)
                                             next_id = speaker_tracking.get('next_id', 1)
                                             speaker_id = f'SPEAKER_{next_id:02d}'
                                             speaker_tracking['speakers'].append({
@@ -714,7 +718,7 @@ class DiarizationPipeline:
                             similarity = self.compare_embeddings(chunk_embedding, registered_embedding_single)
                             voice_similarity = similarity
                             
-                            if similarity >= 0.65:
+                            if similarity >= self.thresholds.wearer_single_threshold_chunk:
                                 is_wearer = True
                                 speaker_id = 'SPEAKER_00'
                                 
@@ -747,9 +751,8 @@ class DiarizationPipeline:
                                                 best_match_similarity = sim
                                                 matched_speaker = known_speaker
                                     
-                                    # Use lower threshold for matching (0.32) to prevent splitting same speaker
-                                    # Lowered from 0.40 to be more aggressive about merging
-                                    if matched_speaker and best_match_similarity >= 0.32:
+                                    t = self.thresholds
+                                    if matched_speaker and best_match_similarity >= t.speaker_match_threshold:
                                         speaker_id = matched_speaker['id']
                                         # Update speaker embedding with running average for stability
                                         old_emb = matched_speaker['embedding']
@@ -757,8 +760,8 @@ class DiarizationPipeline:
                                         matched_speaker['embedding'] = updated_emb
                                         print(f"[DIARIZATION] Chunk matched to {speaker_id} - Similarity: {best_match_similarity:.4f}")
                                     else:
-                                        # Before creating new speaker, check if we should merge (0.28-0.32 range)
-                                        if matched_speaker and best_match_similarity >= 0.28 and best_match_similarity < 0.32:
+                                        t = self.thresholds
+                                        if matched_speaker and (t.speaker_merge_band_low <= best_match_similarity < t.speaker_merge_band_high):
                                             # Close but below threshold - merge with closest speaker
                                             speaker_id = matched_speaker['id']
                                             old_emb = matched_speaker['embedding']
@@ -776,7 +779,7 @@ class DiarizationPipeline:
                                                 for i, s1 in enumerate(non_wearer_speakers):
                                                     for j, s2 in enumerate(non_wearer_speakers[i+1:], start=i+1):
                                                         sim = self.compare_embeddings(s1['embedding'], s2['embedding'])
-                                                        if sim >= 0.35:  # If very similar, merge them
+                                                        if sim >= self.thresholds.speaker_proactive_merge_threshold:
                                                             # Merge s2 into s1
                                                             merged_emb = 0.5 * s1['embedding'] + 0.5 * s2['embedding']
                                                             s1['embedding'] = merged_emb
@@ -818,9 +821,8 @@ class DiarizationPipeline:
                                         best_match_similarity = sim
                                         matched_speaker = known_speaker
                             
-                            # Use lower threshold for matching (0.32) to prevent splitting same speaker
-                            # Lowered from 0.5 to be more aggressive about merging
-                            if matched_speaker and best_match_similarity >= 0.32:
+                            t = self.thresholds
+                            if matched_speaker and best_match_similarity >= t.speaker_match_threshold:
                                 speaker_id = matched_speaker['id']
                                 is_wearer = matched_speaker.get('is_wearer', False)
                                 # Update speaker embedding with running average for stability
@@ -829,8 +831,8 @@ class DiarizationPipeline:
                                 matched_speaker['embedding'] = updated_emb
                                 print(f"[DIARIZATION] Chunk matched to {speaker_id} - Similarity: {best_match_similarity:.4f}")
                             else:
-                                # Before creating new speaker, check if we should merge (0.28-0.32 range)
-                                if matched_speaker and best_match_similarity >= 0.28 and best_match_similarity < 0.32:
+                                t = self.thresholds
+                                if matched_speaker and (t.speaker_merge_band_low <= best_match_similarity < t.speaker_merge_band_high):
                                     # Close but below threshold - merge with closest speaker
                                     speaker_id = matched_speaker['id']
                                     is_wearer = matched_speaker.get('is_wearer', False)
@@ -849,7 +851,7 @@ class DiarizationPipeline:
                                         for i, s1 in enumerate(non_wearer_speakers):
                                             for j, s2 in enumerate(non_wearer_speakers[i+1:], start=i+1):
                                                 sim = self.compare_embeddings(s1['embedding'], s2['embedding'])
-                                                if sim >= 0.35:  # If very similar, merge them
+                                                if sim >= self.thresholds.speaker_proactive_merge_threshold:
                                                     # Merge s2 into s1
                                                     merged_emb = 0.5 * s1['embedding'] + 0.5 * s2['embedding']
                                                     s1['embedding'] = merged_emb
@@ -1158,7 +1160,10 @@ class DiarizationPipeline:
                                 
                                 print(f"[DIARIZATION] Multi-sample results:")
                                 print(f"[DIARIZATION]   Max: {max_sim:.4f}, Avg: {avg_sim:.4f}, Median: {median_sim:.4f}")
-                                print(f"[DIARIZATION]   Matches: {match_count}/{total_samples} samples above 0.65")
+                                print(
+                                    f"[DIARIZATION]   Matches: {match_count}/{total_samples} samples above "
+                                    f"{self.thresholds.wearer_multi_vote_sim_threshold:.2f}"
+                                )
                                 print(f"[DIARIZATION] ===========================================")
                                 
                                 # Decision logic: Adjusted for real-world similarity ranges
@@ -1172,27 +1177,32 @@ class DiarizationPipeline:
                                 
                                 # Multiple criteria for detection (prevents false positives)
                                 
-                                # Criterion 1: High average (most reliable) - slightly lowered for more leniency
-                                if avg_sim >= 0.52:
+                                t = self.thresholds
+
+                                # Criterion 1: High average (most reliable)
+                                if avg_sim >= t.wearer_full_avg_threshold:
                                     is_wearer = True
                                     confidence_pct = avg_sim * 100
                                     print(f"[DIARIZATION] WEARER (AVG MATCH) - Avg: {confidence_pct:.1f}%, Median: {median_sim:.4f}")
                                 
-                                # Criterion 2: Good median + at least one strong match - slightly lowered
-                                elif median_sim >= 0.50 and max_sim >= 0.58:
+                                # Criterion 2: Good median + at least one strong match
+                                elif median_sim >= t.wearer_full_median_threshold and max_sim >= t.wearer_full_median_max_threshold:
                                     is_wearer = True
                                     print(f"[DIARIZATION] WEARER (MEDIAN+MAX) - Median: {median_sim:.4f}, Max: {max_sim:.4f}")
                                 
-                                # Criterion 3: At least 30% of samples match well (lowered from 40%)
-                                elif match_ratio >= 0.3 and max_sim >= 0.62:
+                                # Criterion 3: Enough samples vote strongly
+                                elif match_ratio >= t.wearer_full_match_ratio_threshold and max_sim >= t.wearer_full_match_ratio_max_threshold:
                                     is_wearer = True
                                     print(f"[DIARIZATION] WEARER (VOTE MATCH) - {match_count}/{total_samples} samples, Max: {max_sim:.4f}")
                                 
-                                # Criterion 4: At least 40% of samples are somewhat similar (>= 0.50) - lowered from 50%
-                                elif np.sum(all_sims >= 0.50) >= (total_samples * 0.4):
+                                # Criterion 4: Majority are somewhat similar
+                                elif np.sum(all_sims >= t.wearer_full_count_sim_threshold) >= (total_samples * t.wearer_full_count_ratio_threshold):
                                     is_wearer = True
-                                    matches_50 = int(np.sum(all_sims >= 0.50))
-                                    print(f"[DIARIZATION] WEARER (MAJORITY) - {matches_50}/{total_samples} above 0.50, Avg: {avg_sim:.4f}")
+                                    matches = int(np.sum(all_sims >= t.wearer_full_count_sim_threshold))
+                                    print(
+                                        f"[DIARIZATION] WEARER (MAJORITY) - {matches}/{total_samples} above "
+                                        f"{t.wearer_full_count_sim_threshold:.2f}, Avg: {avg_sim:.4f}"
+                                    )
                                 
                                 else:
                                     is_wearer = False
@@ -1204,7 +1214,7 @@ class DiarizationPipeline:
                                 similarity = self.compare_embeddings(segment_embedding, registered_embedding_single)
                                 voice_similarity = similarity
                                 
-                                SIMILARITY_THRESHOLD = 0.70  # Stricter for single sample
+                                SIMILARITY_THRESHOLD = self.thresholds.wearer_single_threshold_full
                                 
                                 print(f"[DIARIZATION] Similarity: {similarity:.4f} (threshold: {SIMILARITY_THRESHOLD})")
                                 
