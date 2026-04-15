@@ -44,7 +44,7 @@ class ARGlassesServer:
         
         # Load basic settings from env
         self.hf_token = os.getenv("HF_TOKEN")
-        self.transcription_language = os.getenv("TRANSCRIPTION_LANGUAGE", "zh")
+        self.transcription_language = os.getenv("TRANSCRIPTION_LANGUAGE", "yue")
         self.translation_language = None  # Will be set by app request (handle_request)
 
         if not self.hf_token:
@@ -64,7 +64,8 @@ class ARGlassesServer:
             # Pass default transcription language to diarization pipeline
             # Translation language will be provided per request
             self.diarization_pipeline = DiarizationPipeline(
-                self.hf_token
+                self.hf_token,
+                transcription_lang=self.transcription_language
             )
             print("[SERVER] Diarization pipeline loaded successfully")
             
@@ -97,12 +98,14 @@ class ARGlassesServer:
             self.gesture_recognizer = None
         
         self.host = os.getenv("SERVER_HOST", "0.0.0.0")
-        self.port = int(os.getenv("SERVER_PORT", "8000"))
+        self.port = int(os.getenv("SERVER_PORT", "8080"))
         self.active_connections = set()
         
         # Track active processing tasks for parallel execution
         self.active_audio_tasks = {}  # websocket -> set of tasks
         self.active_gesture_tasks = {}  # websocket -> set of tasks
+        self.pending_audio_chunks = {}  # websocket -> latest queued real-time chunk
+        self.chunk_worker_tasks = {}  # websocket -> background worker task for real-time audio
         self.main_loop = None
         self.shutdown_event = asyncio.Event()  # Event to signal shutdown
         self.server = None  # WebSocket server instance
@@ -339,6 +342,79 @@ class ARGlassesServer:
         except Exception as e:
             print(f"[SERVER] Error sending message: {e}")
             return False
+
+    def _track_audio_task(self, websocket, task: asyncio.Task):
+        """Track audio-related background tasks for cleanup."""
+        if websocket not in self.active_audio_tasks:
+            self.active_audio_tasks[websocket] = set()
+        self.active_audio_tasks[websocket].add(task)
+
+        def _cleanup(done_task):
+            tasks = self.active_audio_tasks.get(websocket)
+            if tasks is None:
+                return
+            tasks.discard(done_task)
+            if not tasks:
+                del self.active_audio_tasks[websocket]
+
+        task.add_done_callback(_cleanup)
+
+    def _clear_pending_chunk(self, websocket):
+        """Discard any queued real-time chunk for a connection."""
+        self.pending_audio_chunks.pop(websocket, None)
+
+    async def _queue_latest_chunk(self, websocket, audio_array: np.ndarray, sample_rate: int,
+                                  translation_language: str, chunk_id: str):
+        """Keep only the newest real-time chunk while one is already processing."""
+        replaced_chunk = self.pending_audio_chunks.get(websocket)
+        self.pending_audio_chunks[websocket] = {
+            "audio_array": audio_array,
+            "sample_rate": sample_rate,
+            "translation_language": translation_language,
+            "chunk_id": chunk_id,
+        }
+
+        if replaced_chunk:
+            print(
+                f"[SERVER] Replaced queued chunk {replaced_chunk['chunk_id']} with newer chunk {chunk_id}"
+            )
+            await self._safe_send_message(
+                websocket,
+                {
+                    "type": "audio_processed",
+                    "chunk_id": replaced_chunk["chunk_id"],
+                    "total_segments": 0,
+                    "dropped": True,
+                    "timestamp": time.time(),
+                },
+            )
+
+        existing_worker = self.chunk_worker_tasks.get(websocket)
+        if existing_worker and not existing_worker.done():
+            return
+
+        worker = asyncio.create_task(self._process_latest_chunk_loop(websocket))
+        self.chunk_worker_tasks[websocket] = worker
+        self._track_audio_task(websocket, worker)
+
+    async def _process_latest_chunk_loop(self, websocket):
+        """Process real-time audio chunks serially and skip stale buffered chunks."""
+        try:
+            while True:
+                queued_chunk = self.pending_audio_chunks.pop(websocket, None)
+                if queued_chunk is None:
+                    return
+
+                await self._process_audio_async(
+                    queued_chunk["audio_array"],
+                    queued_chunk["sample_rate"],
+                    queued_chunk["translation_language"],
+                    websocket,
+                    queued_chunk["chunk_id"],
+                    True,
+                )
+        finally:
+            self.chunk_worker_tasks.pop(websocket, None)
 
     async def _process_audio_async(self, audio_array: np.ndarray, sample_rate: int, translation_language: str, 
                                    websocket, chunk_id: str, is_chunk: bool = False):
@@ -717,6 +793,7 @@ class ARGlassesServer:
                         # Reset stop processing flag when starting a new recording session
                         # (but NOT when stop is pressed - that's the user's requirement)
                         self.stop_processing_per_connection[websocket] = False
+                        self._clear_pending_chunk(websocket)
                         print(f"[SERVER] Reset stop flag for new recording session")
                         
                         # allow client to set language at session start
@@ -739,6 +816,11 @@ class ARGlassesServer:
                     elif message_type == "reset_session":
                         # Handle session reset from glasses
                         print("[SERVER] Session reset requested by glasses")
+                        self._clear_pending_chunk(websocket)
+                        self.speaker_tracking[websocket] = {
+                            'speakers': [],
+                            'next_id': 1
+                        }
                         response = {
                             "type": "session_reset",
                             "status_code": 200,
@@ -756,6 +838,7 @@ class ARGlassesServer:
                         
                         # Set stop flag immediately
                         self.stop_processing_per_connection[websocket] = True
+                        self._clear_pending_chunk(websocket)
                         
                         # Log current state
                         print(f"[SERVER] Stop flag set to: {self.stop_processing_per_connection.get(websocket, False)}")
@@ -875,20 +958,26 @@ class ARGlassesServer:
                         if is_chunk:
                             print(f"[SERVER] Starting real-time processing for chunk {chunk_id}...")
                         
-                        task = asyncio.create_task(
-                            self._process_audio_async(
-                                audio_array, 
-                                sample_rate, 
-                                translation_language, 
-                                websocket, 
-                                chunk_id, 
-                                is_chunk
+                        if is_chunk:
+                            await self._queue_latest_chunk(
+                                websocket,
+                                audio_array,
+                                sample_rate,
+                                translation_language,
+                                chunk_id
                             )
-                        )
-                        # Track task for cleanup
-                        if websocket not in self.active_audio_tasks:
-                            self.active_audio_tasks[websocket] = set()
-                        self.active_audio_tasks[websocket].add(task)
+                        else:
+                            task = asyncio.create_task(
+                                self._process_audio_async(
+                                    audio_array, 
+                                    sample_rate, 
+                                    translation_language, 
+                                    websocket, 
+                                    chunk_id, 
+                                    is_chunk
+                                )
+                            )
+                            self._track_audio_task(websocket, task)
                         
                         # Don't await - let it run in parallel with other messages
                         # The task will handle sending results when done
@@ -944,10 +1033,18 @@ class ARGlassesServer:
                             # wearer id
                             voice_id = f"WEARER_VOICE_{int(time.time() * 1000)}"
                             
-                            # Save the wearer's MULTIPLE 192-dim embeddings
+                            # Build clean registered voice profile (filters outliers, builds centroid)
+                            voice_profile = self.diarization_pipeline.build_registered_voice_profile(valid_embeddings)
+                            profile_embeddings = voice_profile["embeddings"]
+                            profile_embedding = voice_profile["profile_embedding"]
+                            discarded = voice_profile["discarded_embeddings"]
+                            
+                            # Save the wearer's voice profile
                             self.registered_voices[voice_id] = {
-                                "embeddings": valid_embeddings,  # List of embeddings
-                                "num_samples": len(valid_embeddings),
+                                "embeddings": profile_embeddings,
+                                "profile_embedding": profile_embedding,
+                                "num_samples": len(profile_embeddings),
+                                "discarded_embeddings": discarded,
                                 "timestamp": time.time(),
                                 "sample_rate": sample_rate
                             }
@@ -955,11 +1052,11 @@ class ARGlassesServer:
                             
                             print(f"[SERVER] ✓✓ Wearer's voice registered with MULTI-SAMPLE!")
                             print(f"[SERVER] Voice ID: {voice_id}")
-                            print(f"[SERVER] Number of samples: {len(valid_embeddings)}")
+                            print(f"[SERVER] Number of samples: {len(profile_embeddings)} (discarded {discarded} outliers)")
                             print(f"[SERVER] Each embedding shape: (192,)")
-                            print(f"[SERVER] Registration method: Multi-sample (robust)")
+                            print(f"[SERVER] Registration method: Multi-sample with profile centroid")
                             print(f"[SERVER] DEBUG: self.registered_voices after registration = {list(self.registered_voices.keys())}")
-                            print(f"[SERVER] Will identify wearer using multi-sample matching")
+                            print(f"[SERVER] Will identify wearer using profile-based matching")
                             print(f"[SERVER] ==========================================")
                             
                             # Send confirmation
@@ -967,9 +1064,9 @@ class ARGlassesServer:
                                 "type": "voice_registered",
                                 "voice_id": voice_id,
                                 "status_code": 200,
-                                "message": f"Wearer's voice registered with {len(valid_embeddings)} samples (multi-sample)",
-                                "num_samples": len(valid_embeddings),
-                                "registration_method": "multi-sample",
+                                "message": f"Wearer's voice registered with {len(profile_embeddings)} samples (profile-based)",
+                                "num_samples": len(profile_embeddings),
+                                "registration_method": "profile-based",
                                 "timestamp": time.time()
                             }
                             await self._safe_send_message(websocket, response)
@@ -1099,15 +1196,18 @@ class ARGlassesServer:
             import traceback
             print(f"[SERVER] Error traceback: {traceback.format_exc()}")
         finally:
+            self._clear_pending_chunk(websocket)
+            self.chunk_worker_tasks.pop(websocket, None)
+
             # Cancel any pending tasks for this connection
             if websocket in self.active_audio_tasks:
-                for task in self.active_audio_tasks[websocket]:
+                for task in list(self.active_audio_tasks[websocket]):
                     if not task.done():
                         task.cancel()
                 del self.active_audio_tasks[websocket]
             
             if websocket in self.active_gesture_tasks:
-                for task in self.active_gesture_tasks[websocket]:
+                for task in list(self.active_gesture_tasks[websocket]):
                     if not task.done():
                         task.cancel()
                 del self.active_gesture_tasks[websocket]
@@ -1134,8 +1234,10 @@ class ARGlassesServer:
         # Cancel all active tasks
         print("[SERVER] Cancelling active tasks...")
         for websocket in list(self.active_connections):
+            self._clear_pending_chunk(websocket)
+            self.chunk_worker_tasks.pop(websocket, None)
             if websocket in self.active_audio_tasks:
-                for task in self.active_audio_tasks[websocket]:
+                for task in list(self.active_audio_tasks[websocket]):
                     if not task.done():
                         task.cancel()
                         try:
@@ -1145,7 +1247,7 @@ class ARGlassesServer:
                 del self.active_audio_tasks[websocket]
             
             if websocket in self.active_gesture_tasks:
-                for task in self.active_gesture_tasks[websocket]:
+                for task in list(self.active_gesture_tasks[websocket]):
                     if not task.done():
                         task.cancel()
                         try:
